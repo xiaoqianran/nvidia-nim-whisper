@@ -136,8 +136,8 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `--chunk-seconds` | 每段时长（秒），`<=0` 关闭分段 |
 | `--overlap-seconds` | 相邻段重叠，减轻边界吞字 |
 | `--workers` | 并行线程数，默认 `8`；`1`=串行 |
-| `--rate-limit` | 滑动窗口最大请求数，默认 `40`；`0`=关闭 |
-| `--rate-window-sec` | 限速窗口秒数，默认 `60` |
+| `--rate-limit` | **Whisper ASR** 滑动窗口次数，默认 `40`；`0`=关闭（也可用 `WHISPER_RATE_LIMIT`） |
+| `--rate-window-sec` | Whisper 限速窗口秒数，默认 `60`（`WHISPER_RATE_WINDOW_SEC`） |
 | `--keep-chunks` | 保留 `*_chunks/` 下分段 WAV |
 | `--translate` | 转写后翻译（需 OpenAI 兼容 Key） |
 | `--to` | 目标语言，默认 `zh-CN` |

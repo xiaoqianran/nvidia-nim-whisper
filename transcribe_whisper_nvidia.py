@@ -798,14 +798,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--rate-limit",
         type=int,
-        default=DEFAULT_RATE_LIMIT,
-        help="滑动窗口内最大请求数（NVIDIA Trial 约 40/min）。0=关闭客户端限速",
+        default=None,
+        help="Whisper ASR 滑动窗口最大请求数（默认 40/min；可用 WHISPER_RATE_LIMIT）。0=关闭",
     )
     p.add_argument(
         "--rate-window-sec",
         type=float,
-        default=DEFAULT_RATE_WINDOW_SEC,
-        help="限速滑动窗口长度（秒）",
+        default=None,
+        help="Whisper ASR 限速窗口秒数（默认 60；可用 WHISPER_RATE_WINDOW_SEC）",
     )
     p.add_argument("--keep-wav", action="store_true", help="保留中间整段 WAV")
     p.add_argument("--keep-chunks", action="store_true", help="保留分段 WAV 文件")
@@ -881,6 +881,22 @@ def main(argv: list[str] | None = None) -> int:
         load_dotenv([args.env_file.expanduser().resolve()])
     else:
         load_dotenv([cwd / ".env", script_dir / ".env"])
+
+    # Whisper ASR 限速：CLI > 环境变量 > 默认 40/60s
+    if args.rate_limit is None:
+        args.rate_limit = int(
+            os.environ.get("WHISPER_RATE_LIMIT")
+            or os.environ.get("NVIDIA_RATE_LIMIT")
+            or os.environ.get("ASR_RATE_LIMIT")
+            or DEFAULT_RATE_LIMIT
+        )
+    if args.rate_window_sec is None:
+        args.rate_window_sec = float(
+            os.environ.get("WHISPER_RATE_WINDOW_SEC")
+            or os.environ.get("NVIDIA_RATE_WINDOW_SEC")
+            or os.environ.get("ASR_RATE_WINDOW_SEC")
+            or DEFAULT_RATE_WINDOW_SEC
+        )
 
     input_path = args.input.expanduser().resolve()
     if not input_path.is_file():
