@@ -1,0 +1,12 @@
+# Whisper ASR 多 Key 列表（每行一个 nvapi-...）
+# 用法：
+#   cp nvidia_api_keys.txt.example nvidia_api_keys.txt
+#   编辑填入真实 Key
+# 或在 .env 里：
+#   NVIDIA_API_KEYS_FILE=nvidia_api_keys.txt
+#   # 也可以不建文件，直接：
+#   # NVIDIA_API_KEYS=nvapi-xxx,nvapi-yyy
+
+nvapi-YOUR_WHISPER_KEY_1
+nvapi-YOUR_WHISPER_KEY_2
+# nvapi-YOUR_WHISPER_KEY_3

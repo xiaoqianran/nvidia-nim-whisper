@@ -5,6 +5,9 @@
 nvidia_api_keys.txt
 *_api_keys.txt
 *.keys
+# 允许提交示例（无真实 key）
+!*.example
+!*_api_keys.txt.example
 
 # Python
 .venv/

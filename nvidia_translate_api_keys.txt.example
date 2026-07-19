@@ -1,0 +1,10 @@
+# 翻译专用多 Key（每行一个 nvapi-...），建议与 ASR Key 分开
+# 用法：
+#   cp nvidia_translate_api_keys.txt.example nvidia_translate_api_keys.txt
+# .env：
+#   NVIDIA_TRANSLATE_API_KEYS_FILE=nvidia_translate_api_keys.txt
+#   # 或：NVIDIA_TRANSLATE_API_KEYS=nvapi-a,nvapi-b
+
+nvapi-YOUR_TRANSLATE_KEY_1
+nvapi-YOUR_TRANSLATE_KEY_2
+# nvapi-YOUR_TRANSLATE_KEY_3

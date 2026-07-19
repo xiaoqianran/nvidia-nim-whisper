@@ -66,15 +66,24 @@ export NVIDIA_API_KEYS_FILE=./nvidia_api_keys.txt
 ./transcribe.sh talk.mp3 --api-keys 'k1,k2,k3' --workers 36
 ```
 
-### 2. 本地 `.env`
+### 2. 本地 `.env` + Key 列表示例
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 NVIDIA_API_KEY=nvapi-...
-# 若需要翻译，再填 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+# 三种用途的 Key 列表（无真实密钥，仅占位）：
+cp nvidia_api_keys.txt.example nvidia_api_keys.txt
+cp nvidia_translate_api_keys.txt.example nvidia_translate_api_keys.txt
+cp nvidia_summarize_api_keys.txt.example nvidia_summarize_api_keys.txt
+# 编辑上述文件或 .env 中的 NVIDIA_*_API_KEYS=k1,k2
 ```
 
-`.env` 已在 `.gitignore` 中，不会被提交。
+| 用途 | 文件示例 | `.env` 内联（可选） |
+|------|----------|---------------------|
+| Whisper ASR | `nvidia_api_keys.txt.example` | `NVIDIA_API_KEYS=...` |
+| 翻译 | `nvidia_translate_api_keys.txt.example` | `NVIDIA_TRANSLATE_API_KEYS=...` |
+| 总结 | `nvidia_summarize_api_keys.txt.example` | `NVIDIA_SUMMARIZE_API_KEYS=...` |
+
+`.env` 与真实 `*_api_keys.txt` 均 gitignore；**仅 `*.example` 可提交**。
 
 ### 3. 命令行参数
 
