@@ -224,12 +224,44 @@ def parse_subtitle_file(path: Path | str) -> list[Cue]:
     return parse_vtt(raw)
 
 
+# 时间轴 / 序号行（写入 .txt 时必须剔除）
+_TS_LINE = re.compile(
+    r"^\d{1,2}:\d{2}:\d{2}[.,]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[.,]\d{3}"
+)
+_INDEX_ONLY = re.compile(r"^\d+$")
+
+
+def _is_timestamp_or_index_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if _TS_LINE.match(s) or "-->" in s:
+        return True
+    if _INDEX_ONLY.match(s):
+        return True
+    if s.upper().startswith("WEBVTT"):
+        return True
+    return False
+
+
 def cues_to_plain_text(cues: list[Cue]) -> str:
-    """合并为纯文本，相邻重复行去重（自动字幕常见）。"""
+    """
+    合并为纯文本（仅台词，无时间轴、无序号）。
+    相邻重复行去重（自动字幕常见）。
+    """
     parts: list[str] = []
     prev = ""
     for c in cues:
         t = c.text.strip()
+        if not t or _is_timestamp_or_index_line(t):
+            continue
+        # 若 cue 文本里误带多行，只保留非时间轴行
+        cleaned_lines = [
+            ln.strip()
+            for ln in t.replace("\r", "\n").split("\n")
+            if ln.strip() and not _is_timestamp_or_index_line(ln)
+        ]
+        t = " ".join(cleaned_lines).strip()
         if not t:
             continue
         if t == prev:
@@ -244,6 +276,33 @@ def cues_to_plain_text(cues: list[Cue]) -> str:
         parts.append(t)
         prev = t
     return "\n".join(parts).strip() + ("\n" if parts else "")
+
+
+def strip_to_plain_text(content: str) -> str:
+    """
+    将任意 SRT/VTT/混杂文本收成纯台词（保险层，供写 .txt 前调用）。
+    """
+    if not content or not content.strip():
+        return ""
+    # 若看起来像字幕文件，先解析
+    if "-->" in content or content.lstrip().upper().startswith("WEBVTT"):
+        try:
+            if re.search(r"\d{2}:\d{2}:\d{2},\d{3}\s*-->", content):
+                cues = parse_srt(content)
+            else:
+                cues = parse_vtt(content)
+            if cues:
+                return cues_to_plain_text(cues)
+        except Exception:
+            pass
+    lines_out: list[str] = []
+    for ln in content.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _is_timestamp_or_index_line(ln):
+            continue
+        t = _clean_text_line(ln)
+        if t:
+            lines_out.append(t)
+    return "\n".join(lines_out).strip() + ("\n" if lines_out else "")
 
 
 def _fmt_srt_ts(sec: float) -> str:

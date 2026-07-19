@@ -15,6 +15,7 @@ from youtube.captions import (
     parse_subtitle_file,
     pick_caption_track,
     safe_stem,
+    strip_to_plain_text,
 )
 from youtube.ytdlp_fetch import download_captions, dump_lang_list_json, list_caption_langs
 
@@ -122,7 +123,8 @@ def process_youtube_url(
 
     src_path = files[track.lang]
     cues = parse_subtitle_file(src_path)
-    plain = cues_to_plain_text(cues)
+    # .txt 只要台词：无 00:00:00 --> 时间轴、无序号
+    plain = strip_to_plain_text(cues_to_plain_text(cues))
     outputs: dict[str, Path] = {}
 
     # 保留原始字幕副本到 out_dir
@@ -174,7 +176,7 @@ def process_youtube_url(
     zh_srt.write_text(cues_to_srt(zh_cues), encoding="utf-8")
     outputs["zh_srt"] = zh_srt
     zh_txt = out_dir / f"{stem}.zh.txt"
-    zh_plain = cues_to_plain_text(zh_cues)
+    zh_plain = strip_to_plain_text(cues_to_plain_text(zh_cues))
     zh_txt.write_text(zh_plain if zh_plain.endswith("\n") else zh_plain + "\n", encoding="utf-8")
     outputs["zh_txt"] = zh_txt
     _log(f"已写简体字幕: {zh_srt}")

@@ -17,6 +17,7 @@ from youtube.captions import (
     is_simplified_chinese_lang,
     parse_subtitle_file,
     pick_caption_track,
+    strip_to_plain_text,
 )
 
 
@@ -76,9 +77,22 @@ def test_parse_vtt_and_plain_text():
     plain = cues_to_plain_text(cues)
     assert "Hello world." in plain
     assert "<c>" not in plain
+    assert "-->" not in plain
+    assert "00:00:00" not in plain
     srt = cues_to_srt(cues)
     assert "-->" in srt
     assert "Hello world." in srt
+
+
+def test_txt_never_contains_timestamps():
+    """.txt 只要文字：不得出现时间轴行。"""
+    raw = (FIXTURES / "sample_zh.srt").read_text(encoding="utf-8")
+    assert "-->" in raw  # fixture 本身是 srt
+    plain = strip_to_plain_text(raw)
+    assert "-->" not in plain
+    assert "00:00:00" not in plain
+    assert "你好世界" in plain
+    assert not any(line.strip().isdigit() for line in plain.splitlines() if line.strip())
 
 
 def test_parse_srt_zh_fixture():
