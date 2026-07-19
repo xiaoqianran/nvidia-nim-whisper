@@ -205,15 +205,39 @@ huggingface-cli login             # 或 export HF_TOKEN=hf_...
 
 ### 运行
 
+**推荐：持续拉取 + 自动 Whisper + 译中 + 清理缓存**
+
 ```bash
-# 试跑 50 条 xs + 译中
+# 配置 .env: HF_TOKEN / NVIDIA keys / OPENAI_*
+chmod +x run_gigaspeech_continuous.sh
+
+# 一直跑 xs（Ctrl+C 可停，--resume 可续）
+./run_gigaspeech_continuous.sh
+
+# 或限制条数试跑
+./run_gigaspeech_continuous.sh --max-samples 100
+
+# 换子集
+GIGASPEECH_SUBSET=s ./run_gigaspeech_continuous.sh
+```
+
+行为：
+
+1. HF **streaming** 按条拉取（不整库下载）  
+2. 内存里 PCM → Whisper（多 Key 池）→ 中文翻译  
+3. 写出 JSONL 一行后 **丢掉音频数组**  
+4. 每 20 条（可调）清理 `.hf_cache`，结束时再清一遍  
+5. 磁盘长期只剩：`*.jsonl` + `*.state.sqlite`
+
+```bash
+# 等价 Python 入口
+python -m dataset.run_continuous --subset xs --max-samples 50
+
+# 底层参数全开时
 python -m dataset.gigaspeech_pipeline \
   --subset xs --max-samples 50 --translate \
   --out-dir ./out/gigaspeech_xs \
-  --hf-cache-dir ./out/.hf_cache
-
-# 断点续跑（默认 --resume）
-python -m dataset.gigaspeech_pipeline --subset xs --out-dir ./out/gigaspeech_xs --translate
+  --cleanup-every 20 --max-cache-gb 1.5 --min-free-gb 2
 
 # 跳过 ASR，只用官方英文 ref 译中（省 NVIDIA 配额）
 python -m dataset.gigaspeech_pipeline --subset xs --skip-whisper-use-ref --translate --max-samples 100

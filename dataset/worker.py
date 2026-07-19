@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dataset.audio_util import to_pcm16_mono_16k
+from dataset.cleanup import free_audio_memory
 from dataset.source_hf import GigaSample
 
 # 保证可 import 仓库根模块
@@ -54,6 +55,8 @@ def process_sample(
 
     try:
         pcm, duration = to_pcm16_mono_16k(sample.audio_array, sample.sampling_rate, sample_rate)
+        # 解码后立刻丢掉原始 array，降低峰值内存
+        free_audio_memory(sample)
         rec["duration_sec"] = round(duration, 3)
 
         if skip_whisper_use_ref:
@@ -73,6 +76,8 @@ def process_sample(
                 sample_rate=sample_rate,
                 word_offsets=word_offsets,
             )
+            # PCM 用完即释
+            del pcm
             text, _segs = parse_response(resp)
             whisper_text = text or ""
             rec["whisper_text"] = whisper_text
@@ -85,6 +90,9 @@ def process_sample(
         rec["elapsed_sec"] = round(time.time() - t0, 3)
         return rec
     except Exception as e:
+        free_audio_memory(sample)
         rec["error"] = f"{type(e).__name__}: {e}"
         rec["elapsed_sec"] = round(time.time() - t0, 3)
         return rec
+    finally:
+        free_audio_memory(sample)

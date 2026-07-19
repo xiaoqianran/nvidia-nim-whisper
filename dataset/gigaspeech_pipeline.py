@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,6 +28,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from dataset.cleanup import disk_free_gb, purge_hf_cache
 from dataset.sink import JsonlSink
 from dataset.source_hf import iter_gigaspeech
 from dataset.state import SegmentState
@@ -86,19 +86,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hf-cache-dir",
         type=Path,
         default=None,
-        help="限制 HF 缓存目录（省磁盘）",
+        help="限制 HF 缓存目录（省磁盘）；处理完会定期清理",
+    )
+    p.add_argument(
+        "--cleanup-every",
+        type=int,
+        default=25,
+        help="每成功 N 条清理一次 HF 缓存（0=仅结束时清理）",
+    )
+    p.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=2.0,
+        help="磁盘剩余低于此值时强制清理缓存",
+    )
+    p.add_argument(
+        "--max-cache-gb",
+        type=float,
+        default=2.0,
+        help="HF 缓存超过此大小时清理",
     )
     p.add_argument("--env-file", type=Path, default=None)
     p.add_argument("-q", "--quiet", action="store_true")
     return p.parse_args(argv)
-
-
-def _disk_free_gb(path: Path) -> float:
-    try:
-        u = shutil.disk_usage(path if path.exists() else path.parent)
-        return u.free / (1024**3)
-    except OSError:
-        return -1.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,12 +120,17 @@ def main(argv: list[str] | None = None) -> int:
     else:
         load_dotenv([cwd / ".env", script_dir / ".env"])
 
+    # 默认把 HF 缓存放到 out-dir 下，便于清理且不占系统盘
     if args.hf_cache_dir:
         cache = args.hf_cache_dir.expanduser().resolve()
-        cache.mkdir(parents=True, exist_ok=True)
-        os.environ["HF_HOME"] = str(cache)
-        os.environ["HF_DATASETS_CACHE"] = str(cache / "datasets")
-        os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
+    else:
+        cache = (args.out_dir.expanduser().resolve() / ".hf_cache")
+    cache.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(cache)
+    os.environ["HF_DATASETS_CACHE"] = str(cache / "datasets")
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache / "hub")
+    # 尽量少落盘
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
     if args.rate_limit is None:
         args.rate_limit = int(
@@ -190,7 +205,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"子集={args.subset} split={args.split} max_samples={args.max_samples or '∞'}")
         print(f"输出: {jsonl_path}")
         print(f"状态: {state_path}")
-        print(f"磁盘剩余: {_disk_free_gb(out_dir):.2f} GB @ {out_dir}")
+        print(f"磁盘剩余: {disk_free_gb(out_dir):.2f} GB @ {out_dir}")
+        print(f"HF 缓存: {cache}（每 {args.cleanup_every or '∞'} 条清理）")
         if pool:
             print(
                 f"ASR Key 池: {pool.size} × {args.rate_limit}/{args.rate_window_sec:g}s"
@@ -215,6 +231,26 @@ def main(argv: list[str] | None = None) -> int:
     submitted = 0
     t0 = time.time()
 
+    def _maybe_cleanup(force: bool = False) -> None:
+        if not force and args.cleanup_every <= 0:
+            return
+        if not force and args.cleanup_every > 0 and ok > 0 and ok % args.cleanup_every != 0:
+            return
+        info = purge_hf_cache(
+            cache,
+            min_free_gb=args.min_free_gb,
+            max_cache_gb=args.max_cache_gb,
+            force=force or (args.cleanup_every > 0 and ok > 0 and ok % args.cleanup_every == 0),
+            older_than_sec=60,
+        )
+        if not args.quiet and info.get("purged"):
+            mb = info["removed_bytes"] / (1024 * 1024)
+            print(
+                f"  [cleanup] 清理缓存 {mb:.1f} MB | "
+                f"free {info['free_gb_before']:.2f}→{info['free_gb_after']:.2f} GB",
+                flush=True,
+            )
+
     def _handle_result(rec: dict[str, Any]) -> None:
         nonlocal ok, err
         sid = rec["segment_id"]
@@ -235,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"  OK [{ok}] {sid} {rec.get('duration_sec')}s | {prev}…{extra}",
                     flush=True,
                 )
+            _maybe_cleanup(force=False)
 
     exit_code = 0
     try:
@@ -296,7 +333,27 @@ def main(argv: list[str] | None = None) -> int:
                 print("Key 统计:")
                 for row in pool.stats_summary():
                     print(f"  {row['key']}: {row['requests']} 次")
-            print(f"磁盘剩余: {_disk_free_gb(out_dir):.2f} GB")
+            # 结束强制清缓存
+            try:
+                info = purge_hf_cache(
+                    cache,
+                    min_free_gb=0,
+                    max_cache_gb=0,
+                    force=True,
+                    older_than_sec=0,
+                )
+                print(
+                    f"结束清理缓存: {info['removed_bytes']/(1024*1024):.1f} MB | "
+                    f"磁盘剩余 {disk_free_gb(out_dir):.2f} GB"
+                )
+            except Exception as ce:
+                print(f"结束清理失败: {ce}")
+            print(f"磁盘剩余: {disk_free_gb(out_dir):.2f} GB")
+        else:
+            try:
+                purge_hf_cache(cache, force=True, older_than_sec=0, min_free_gb=0, max_cache_gb=0)
+            except Exception:
+                pass
         try:
             state.close()
         except Exception:
