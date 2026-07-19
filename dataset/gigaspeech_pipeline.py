@@ -236,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
 
+    exit_code = 0
     try:
         pending: set[Any] = set()
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -275,11 +276,10 @@ def main(argv: list[str] | None = None) -> int:
 
     except KeyboardInterrupt:
         print("\n中断：已写出部分结果，可用 --resume 继续", file=sys.stderr)
+        exit_code = 130
     except Exception as e:
         print(f"错误: {type(e).__name__}: {e}", file=sys.stderr)
-        state.close()
-        sink.close()
-        return 1
+        exit_code = 1
     finally:
         elapsed = time.time() - t0
         if not args.quiet:
@@ -288,15 +288,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"成功: {ok}  失败: {err}  提交: {submitted}")
             print(f"耗时: {elapsed:.1f}s")
             print(f"JSONL 行(本次打开后写入): {sink.written}")
-            print(f"state: {state.counts()}")
+            try:
+                print(f"state: {state.counts()}")
+            except Exception:
+                pass
             if pool:
                 print("Key 统计:")
                 for row in pool.stats_summary():
                     print(f"  {row['key']}: {row['requests']} 次")
             print(f"磁盘剩余: {_disk_free_gb(out_dir):.2f} GB")
-        state.close()
-        sink.close()
+        try:
+            state.close()
+        except Exception:
+            pass
+        try:
+            sink.close()
+        except Exception:
+            pass
 
+    if exit_code != 0:
+        return exit_code
     return 0 if err == 0 or ok > 0 else 1
 
 
