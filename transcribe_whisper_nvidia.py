@@ -1073,7 +1073,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--translate-rate-limit",
         type=int,
         default=None,
-        help="翻译 API 滑动窗口限速（次），默认 40；0=关闭。可用 TRANSLATE_RATE_LIMIT",
+        help="翻译 API 滑动窗口限速（次），默认 120；0=关闭。可用 TRANSLATE_RATE_LIMIT",
     )
     p.add_argument(
         "--translate-rate-window-sec",

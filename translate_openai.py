@@ -44,8 +44,9 @@ DEFAULT_TARGET = "zh-CN"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_TIMEOUT = 120
-# 与常见 Trial / 网关一致：滑动窗口 40 次/分钟
-DEFAULT_RATE_LIMIT = 40
+# 翻译默认限速（NewAPI 等网关后多 Key 随机负载时，可高于单 Key 40）
+# 建议：单 Key≈40；后端约 6 Key 随机分配时用 120 更稳妥
+DEFAULT_RATE_LIMIT = 120
 DEFAULT_RATE_WINDOW_SEC = 60.0
 
 
@@ -256,7 +257,7 @@ class OpenAICompatTranslator:
         """
         按片段翻译，写入 out_key，保留时间轴字段。
         workers=1 串行；>1 并行（按 index 回填）。
-        受 rate_limit 滑动窗口约束（默认 40/min）。
+        受 rate_limit 滑动窗口约束（默认 120/min）。
         """
         total = len(segments)
         if total == 0:
