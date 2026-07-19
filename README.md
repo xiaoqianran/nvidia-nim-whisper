@@ -41,7 +41,29 @@ uv venv && uv pip install -r requirements.txt
 ### 1. 环境变量
 
 ```bash
+# 单 Key
 export NVIDIA_API_KEY='nvapi-...'
+
+# 多 Key 负载均衡（推荐）：总配额 ≈ n × 40/min
+export NVIDIA_API_KEYS='nvapi-key1,nvapi-key2,nvapi-key3'
+# 或每行一个的文件
+export NVIDIA_API_KEYS_FILE=./nvidia_api_keys.txt
+```
+
+#### 多 Key 方案（突破 40/min）
+
+| 概念 | 说明 |
+|------|------|
+| 每 Key 限速 | 默认 40 次 / 60s 滑动窗口 |
+| 池化调度 | 有余量的 Key 轮询使用；全满则等最早释放的 Key |
+| 有效吞吐 | `n_keys × 40 / min`（6 个 Key ≈ **240/min**） |
+| 并发 | 默认 `workers = min(48, max(8, n_keys×6))` |
+| 失败 | 疑似限流时换 Key 重试 |
+
+```bash
+# keys.txt 每行一个 nvapi-...
+./transcribe.sh talk.mp3 --api-keys-file keys.txt
+./transcribe.sh talk.mp3 --api-keys 'k1,k2,k3' --workers 36
 ```
 
 ### 2. 本地 `.env`

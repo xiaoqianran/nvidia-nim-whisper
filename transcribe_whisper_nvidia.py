@@ -521,29 +521,239 @@ class SlidingWindowRateLimiter:
         self._times: deque[float] = deque()
         self._lock = threading.Lock()
 
+    def _prune(self, now: float) -> None:
+        while self._times and now - self._times[0] >= self.window_sec:
+            self._times.popleft()
+
+    def remaining(self) -> int:
+        if self.max_calls <= 0:
+            return 10**9
+        with self._lock:
+            self._prune(time.monotonic())
+            return max(0, self.max_calls - len(self._times))
+
+    def wait_seconds(self) -> float:
+        """若当前无槽位，需等待多久；有槽位则 0。"""
+        if self.max_calls <= 0:
+            return 0.0
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if len(self._times) < self.max_calls:
+                return 0.0
+            return max(0.0, self.window_sec - (now - self._times[0]) + 0.02)
+
+    def try_acquire(self) -> bool:
+        """非阻塞：有名额则占用并返回 True。"""
+        if self.max_calls <= 0:
+            return True
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            if len(self._times) < self.max_calls:
+                self._times.append(now)
+                return True
+            return False
+
     def acquire(self, quiet: bool = True) -> float:
         """阻塞直到拿到名额，返回等待秒数。"""
         waited = 0.0
         if self.max_calls <= 0:
             return 0.0
         while True:
-            with self._lock:
-                now = time.monotonic()
-                while self._times and now - self._times[0] >= self.window_sec:
-                    self._times.popleft()
-                if len(self._times) < self.max_calls:
-                    self._times.append(now)
-                    return waited
-                sleep_for = self.window_sec - (now - self._times[0]) + 0.02
-            if sleep_for > 0:
-                if not quiet:
-                    print(
-                        f"  限速等待 {sleep_for:.1f}s"
-                        f"（滑动窗口 {self.max_calls}/{self.window_sec:g}s）…",
-                        flush=True,
-                    )
-                time.sleep(sleep_for)
-                waited += sleep_for
+            if self.try_acquire():
+                return waited
+            sleep_for = self.wait_seconds()
+            if sleep_for <= 0:
+                sleep_for = 0.05
+            if not quiet:
+                print(
+                    f"  限速等待 {sleep_for:.1f}s"
+                    f"（滑动窗口 {self.max_calls}/{self.window_sec:g}s）…",
+                    flush=True,
+                )
+            time.sleep(sleep_for)
+            waited += sleep_for
+
+
+def mask_api_key(key: str) -> str:
+    k = key.strip()
+    if len(k) <= 16:
+        return k[:4] + "…"
+    return f"{k[:12]}…{k[-4:]}"
+
+
+def parse_api_keys_blob(text: str) -> list[str]:
+    """解析逗号/空白/换行分隔的 key 列表。"""
+    if not text:
+        return []
+    parts: list[str] = []
+    for line in text.replace(";", "\n").replace(",", "\n").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts.append(line)
+    # 去重保序
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def load_nvidia_api_keys(
+    *,
+    cli_key: str | None,
+    cli_keys: str | None,
+    keys_file: Path | None,
+) -> list[str]:
+    """
+    收集 API Key，优先级合并（去重保序）:
+      --api-key / --api-keys / --api-keys-file
+      NVIDIA_API_KEY / NVIDIA_API_KEYS / NGC_API_KEY
+      NVIDIA_API_KEYS_FILE 指向的文件
+    """
+    keys: list[str] = []
+    if cli_key:
+        keys.extend(parse_api_keys_blob(cli_key))
+    if cli_keys:
+        keys.extend(parse_api_keys_blob(cli_keys))
+    if keys_file and keys_file.is_file():
+        keys.extend(parse_api_keys_blob(keys_file.read_text(encoding="utf-8")))
+
+    env_file = os.environ.get("NVIDIA_API_KEYS_FILE") or os.environ.get("NVAPI_KEYS_FILE")
+    if env_file:
+        p = Path(env_file).expanduser()
+        if p.is_file():
+            keys.extend(parse_api_keys_blob(p.read_text(encoding="utf-8")))
+
+    keys.extend(parse_api_keys_blob(os.environ.get("NVIDIA_API_KEYS") or ""))
+    keys.extend(parse_api_keys_blob(os.environ.get("NVAPI_KEYS") or ""))
+    single = os.environ.get("NVIDIA_API_KEY") or os.environ.get("NGC_API_KEY") or ""
+    if single.strip():
+        keys.extend(parse_api_keys_blob(single))
+
+    # 去重保序
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+class NvidiaApiKeyPool:
+    """
+    多 Key 负载均衡 + 每 Key 独立滑动窗口限速。
+
+    有效吞吐 ≈ n_keys × rate_limit / window（例如 6×40 = 240 次/分钟）。
+    调度：优先选有剩余配额的 Key（轮询）；全满则等待最先腾出名额的 Key。
+    """
+
+    def __init__(
+        self,
+        keys: list[str],
+        *,
+        riva_client: Any,
+        server: str,
+        function_id: str,
+        max_mb: int,
+        rate_limit: int = DEFAULT_RATE_LIMIT,
+        rate_window_sec: float = DEFAULT_RATE_WINDOW_SEC,
+    ) -> None:
+        if not keys:
+            raise ValueError("API Key 池为空")
+        self.keys = list(keys)
+        self.rate_limit = rate_limit
+        self.rate_window_sec = rate_window_sec
+        self._riva = riva_client
+        self._server = server
+        self._function_id = function_id
+        self._max_mb = max_mb
+        self._limiters = {
+            k: SlidingWindowRateLimiter(rate_limit, rate_window_sec) for k in self.keys
+        }
+        self._services: dict[str, Any] = {}
+        self._svc_lock = threading.Lock()
+        self._rr = 0
+        self._rr_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._stats: dict[str, int] = {k: 0 for k in self.keys}
+
+    @property
+    def size(self) -> int:
+        return len(self.keys)
+
+    def effective_rpm(self) -> int:
+        if self.rate_limit <= 0:
+            return 0
+        return self.rate_limit * len(self.keys)
+
+    def _get_service(self, key: str):
+        with self._svc_lock:
+            svc = self._services.get(key)
+            if svc is None:
+                svc = build_asr_service(
+                    self._riva,
+                    api_key=key,
+                    server=self._server,
+                    function_id=self._function_id,
+                    max_mb=self._max_mb,
+                )
+                self._services[key] = svc
+            return svc
+
+    def acquire(self, quiet: bool = True) -> tuple[str, Any]:
+        """占用一个 Key 名额，返回 (key, asr_service)。"""
+        if self.rate_limit <= 0:
+            with self._rr_lock:
+                idx = self._rr % len(self.keys)
+                self._rr += 1
+            key = self.keys[idx]
+            with self._stats_lock:
+                self._stats[key] = self._stats.get(key, 0) + 1
+            return key, self._get_service(key)
+
+        waited_total = 0.0
+        while True:
+            # 从 rr 起点轮询，优先 try_acquire 成功的 Key
+            with self._rr_lock:
+                start = self._rr
+                self._rr += 1
+            n = len(self.keys)
+            for off in range(n):
+                key = self.keys[(start + off) % n]
+                if self._limiters[key].try_acquire():
+                    with self._stats_lock:
+                        self._stats[key] = self._stats.get(key, 0) + 1
+                    return key, self._get_service(key)
+
+            # 全部占满：睡到「最早释放」的那个
+            sleep_for = min(self._limiters[k].wait_seconds() for k in self.keys)
+            sleep_for = max(0.05, sleep_for)
+            if not quiet:
+                print(
+                    f"  Key 池限速等待 {sleep_for:.1f}s"
+                    f"（{self.size} keys × {self.rate_limit}/{self.rate_window_sec:g}s"
+                    f" ≈ {self.effective_rpm()}/min）…",
+                    flush=True,
+                )
+            time.sleep(sleep_for)
+            waited_total += sleep_for
+
+    def stats_summary(self) -> list[dict[str, Any]]:
+        with self._stats_lock:
+            return [
+                {
+                    "key": mask_api_key(k),
+                    "requests": self._stats.get(k, 0),
+                    "remaining_slots": self._limiters[k].remaining(),
+                }
+                for k in self.keys
+            ]
 
 
 def _wav_to_pcm(wav_path: Path) -> bytes | None:
@@ -571,25 +781,25 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
 
 def transcribe_one_chunk(
     riva_client,
-    asr,
     chunk: AudioChunk,
     language_code: str,
     sample_rate: int,
     word_offsets: bool,
-    limiter: SlidingWindowRateLimiter | None = None,
+    pool: NvidiaApiKeyPool,
     quiet: bool = True,
     max_retries: int = 5,
-) -> tuple[AudioChunk, str, list[dict[str, Any]], float]:
-    """转录单个 chunk，返回 (chunk, text, segments_global, elapsed)."""
+) -> tuple[AudioChunk, str, list[dict[str, Any]], float, str]:
+    """转录单个 chunk，返回 (chunk, text, segments_global, elapsed, key_mask)."""
     raw = chunk.path.read_bytes()
     pcm = _wav_to_pcm(chunk.path)
     audio = pcm if pcm is not None else raw
 
     t0 = time.time()
     last_err: BaseException | None = None
+    used_key = ""
     for attempt in range(1, max_retries + 1):
-        if limiter is not None:
-            limiter.acquire(quiet=quiet)
+        key, asr = pool.acquire(quiet=quiet)
+        used_key = key
         try:
             resp = offline_transcribe(
                 riva_client,
@@ -607,8 +817,8 @@ def transcribe_one_chunk(
             backoff = min(30.0, 1.5 * attempt + 0.5)
             if not quiet:
                 print(
-                    f"  chunk#{chunk.index} 疑似限速，{backoff:.1f}s 后重试"
-                    f"（{attempt}/{max_retries}）: {e}",
+                    f"  chunk#{chunk.index} key={mask_api_key(key)} 疑似限速，"
+                    f"{backoff:.1f}s 后换 Key 重试（{attempt}/{max_retries}）: {e}",
                     flush=True,
                 )
             time.sleep(backoff)
@@ -628,42 +838,36 @@ def transcribe_one_chunk(
         s["chunk_start"] = chunk.start_sec
         s["chunk_end"] = chunk.end_sec
 
-    return chunk, text, segs, elapsed
+    return chunk, text, segs, elapsed, mask_api_key(used_key)
 
 
 def run_chunks(
     riva_client,
-    asr,
+    pool: NvidiaApiKeyPool,
     chunks: list[AudioChunk],
     language_code: str,
     sample_rate: int,
     word_offsets: bool,
     workers: int,
     quiet: bool,
-    rate_limit: int = DEFAULT_RATE_LIMIT,
-    rate_window_sec: float = DEFAULT_RATE_WINDOW_SEC,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     """
     对 chunk 列表做识别。
 
     workers=1: 串行
-    workers>1: 线程池并行（受滑动窗口限速约束）
+    workers>1: 线程池并行；Key 池负载均衡 + 每 Key 独立限速
     """
-    results: dict[int, tuple[str, list[dict[str, Any]], float]] = {}
+    results: dict[int, tuple[str, list[dict[str, Any]], float, str]] = {}
     total = len(chunks)
-    limiter = (
-        SlidingWindowRateLimiter(rate_limit, rate_window_sec) if rate_limit > 0 else None
-    )
 
     def _work(ch: AudioChunk):
         return transcribe_one_chunk(
             riva_client,
-            asr,
             ch,
             language_code,
             sample_rate,
             word_offsets,
-            limiter=limiter,
+            pool=pool,
             quiet=quiet,
         )
 
@@ -676,38 +880,40 @@ def run_chunks(
                     flush=True,
                 )
             try:
-                chunk, text, segs, elapsed = _work(ch)
+                chunk, text, segs, elapsed, key_m = _work(ch)
             except Exception as e:
                 die(f"chunk#{ch.index} 转录失败: {type(e).__name__}: {e}")
-            results[chunk.index] = (text, segs, elapsed)
+            results[chunk.index] = (text, segs, elapsed, key_m)
             if not quiet:
                 preview = (text[:80] + "…") if len(text) > 80 else text
-                print(f"    完成 {elapsed:.1f}s | {preview}", flush=True)
+                print(f"    完成 {elapsed:.1f}s key={key_m} | {preview}", flush=True)
     else:
         if not quiet:
+            rpm = pool.effective_rpm()
             rl = (
-                f"限速 {rate_limit}/{rate_window_sec:g}s 滑动窗口"
-                if rate_limit > 0
-                else "无限速"
+                f"{pool.size} keys × {pool.rate_limit}/{pool.rate_window_sec:g}s"
+                f" ≈ {rpm}/min"
+                if pool.rate_limit > 0
+                else f"{pool.size} keys 无限速"
             )
-            print(f"并行 workers={workers}，共 {total} 个 chunk，{rl} …", flush=True)
+            print(f"并行 workers={workers}，共 {total} 个 chunk，Key 池 {rl} …", flush=True)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(_work, ch): ch for ch in chunks}
             done = 0
             for fut in as_completed(futs):
                 ch = futs[fut]
                 try:
-                    chunk, text, segs, elapsed = fut.result()
+                    chunk, text, segs, elapsed, key_m = fut.result()
                 except Exception as e:
                     die(f"chunk#{ch.index} 转录失败: {type(e).__name__}: {e}")
-                results[chunk.index] = (text, segs, elapsed)
+                results[chunk.index] = (text, segs, elapsed, key_m)
                 done += 1
                 if not quiet:
                     preview = (text[:80] + "…") if len(text) > 80 else text
                     print(
                         f"[{done}/{total}] chunk#{chunk.index} "
                         f"{chunk.start_sec:.1f}s–{chunk.end_sec:.1f}s "
-                        f"完成 {elapsed:.1f}s | {preview}",
+                        f"完成 {elapsed:.1f}s key={key_m} | {preview}",
                         flush=True,
                     )
 
@@ -715,7 +921,7 @@ def run_chunks(
     all_segments: list[dict[str, Any]] = []
     chunk_meta: list[dict[str, Any]] = []
     for ch in sorted(chunks, key=lambda c: c.index):
-        text, segs, elapsed = results[ch.index]
+        text, segs, elapsed, key_m = results[ch.index]
         if text:
             texts.append(text)
         all_segments.extend(segs)
@@ -727,6 +933,7 @@ def run_chunks(
                 "path": str(ch.path.name),
                 "elapsed_sec": round(elapsed, 3),
                 "chars": len(text),
+                "api_key": key_m,
             }
         )
 
@@ -755,7 +962,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--api-key",
         default=None,
-        help="NVIDIA API Key；默认读 NVIDIA_API_KEY / NGC_API_KEY / .env",
+        help="单个 NVIDIA API Key（可与 --api-keys 合并）",
+    )
+    p.add_argument(
+        "--api-keys",
+        default=None,
+        help="多个 Key，逗号/换行分隔；用于负载均衡突破单 Key 40/min",
+    )
+    p.add_argument(
+        "--api-keys-file",
+        type=Path,
+        default=None,
+        help="Key 列表文件（每行一个）；也可用环境变量 NVIDIA_API_KEYS_FILE",
     )
     p.add_argument(
         "--env-file",
@@ -792,8 +1010,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--workers",
         type=int,
-        default=DEFAULT_WORKERS,
-        help="并行请求线程数。1=串行；默认并行以缩短墙钟时间",
+        default=None,
+        help="并行请求线程数。1=串行；默认按 Key 数量自动：min(48, max(8, n_keys*6))",
     )
     p.add_argument(
         "--rate-limit",
@@ -882,7 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         load_dotenv([cwd / ".env", script_dir / ".env"])
 
-    # Whisper ASR 限速：CLI > 环境变量 > 默认 40/60s
+    # Whisper ASR 限速：CLI > 环境变量 > 默认 40/60s（按「每个 Key」计）
     if args.rate_limit is None:
         args.rate_limit = int(
             os.environ.get("WHISPER_RATE_LIMIT")
@@ -902,15 +1120,23 @@ def main(argv: list[str] | None = None) -> int:
     if not input_path.is_file():
         die(f"输入文件不存在: {input_path}")
 
-    api_key = args.api_key or os.environ.get("NVIDIA_API_KEY") or os.environ.get("NGC_API_KEY")
-    if not api_key:
+    api_keys = load_nvidia_api_keys(
+        cli_key=args.api_key,
+        cli_keys=args.api_keys,
+        keys_file=args.api_keys_file.expanduser() if args.api_keys_file else None,
+    )
+    if not api_keys:
         die(
             "未找到 API Key。请任选其一:\n"
             "  export NVIDIA_API_KEY='nvapi-...'\n"
-            "  在项目根目录创建 .env（参考 .env.example）\n"
-            "  或传入 --api-key"
+            "  export NVIDIA_API_KEYS='key1,key2,key3'   # 多 Key 负载均衡\n"
+            "  或 --api-keys-file keys.txt（每行一个）\n"
+            "  或项目 .env（参考 .env.example）"
         )
 
+    # workers：默认按 Key 数放大，吃满多 Key 配额
+    if args.workers is None:
+        args.workers = min(48, max(DEFAULT_WORKERS, len(api_keys) * 6))
     if args.workers < 1:
         die("--workers 至少为 1")
 
@@ -920,6 +1146,16 @@ def main(argv: list[str] | None = None) -> int:
 
     riva_client = import_riva()
     duration = probe_duration(input_path)
+
+    pool = NvidiaApiKeyPool(
+        api_keys,
+        riva_client=riva_client,
+        server=args.server,
+        function_id=args.function_id,
+        max_mb=args.max_message_mb,
+        rate_limit=args.rate_limit,
+        rate_window_sec=args.rate_window_sec,
+    )
 
     with tempfile.TemporaryDirectory(prefix="whisper_nv_") as tmp:
         tmp_dir = Path(tmp)
@@ -942,48 +1178,46 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             size_mb = wav_path.stat().st_size / 1e6
             print(f"音频大小: {size_mb:.2f} MB | 时长约: {duration:.1f} s | 采样率: {wav_rate}")
+            print(
+                f"API Key 池: {pool.size} 个"
+                + (
+                    f" | 每 Key {args.rate_limit}/{args.rate_window_sec:g}s"
+                    f" | 合计约 {pool.effective_rpm()}/min"
+                    if args.rate_limit > 0
+                    else " | 无限速"
+                )
+            )
+            for i, k in enumerate(api_keys, 1):
+                print(f"  [{i}] {mask_api_key(k)}")
             if args.chunk_seconds <= 0:
                 print("分段: 关闭（整段一次请求）")
             else:
                 mode = "并行" if args.workers > 1 else "串行"
-                rl = (
-                    f"限速 {args.rate_limit}/{args.rate_window_sec:g}s"
-                    if args.rate_limit > 0
-                    else "无限速"
-                )
                 print(
                     f"分段: {len(chunks)} 片 × {args.chunk_seconds:g}s"
                     f"（重叠 {args.overlap_seconds:g}s）"
-                    f" | workers={args.workers} ({mode}) | {rl}"
+                    f" | workers={args.workers} ({mode})"
                 )
-
-        asr = build_asr_service(
-            riva_client,
-            api_key=api_key,
-            server=args.server,
-            function_id=args.function_id,
-            max_mb=args.max_message_mb,
-        )
 
         if not args.quiet:
             print("正在调用 NVIDIA Whisper Large V3 …")
         t0 = time.time()
         full_text, segments, chunk_meta = run_chunks(
             riva_client,
-            asr,
+            pool,
             chunks,
             language_code=args.language,
             sample_rate=args.sample_rate,
             word_offsets=args.word_offsets,
             workers=args.workers,
             quiet=args.quiet,
-            rate_limit=args.rate_limit,
-            rate_window_sec=args.rate_window_sec,
         )
         elapsed = time.time() - t0
         if not args.quiet:
             print(f"全部完成，总耗时 {elapsed:.1f} s")
-
+            print("Key 使用统计:")
+            for row in pool.stats_summary():
+                print(f"  {row['key']}: {row['requests']} 次")
     if not full_text:
         die("未得到任何转写文本（空结果）")
 
@@ -1073,8 +1307,11 @@ def main(argv: list[str] | None = None) -> int:
             "chunk_seconds": args.chunk_seconds,
             "overlap_seconds": args.overlap_seconds,
             "workers": args.workers,
-            "rate_limit": args.rate_limit,
+            "rate_limit_per_key": args.rate_limit,
             "rate_window_sec": args.rate_window_sec,
+            "api_key_count": pool.size,
+            "effective_rpm": pool.effective_rpm(),
+            "api_key_stats": pool.stats_summary(),
             "chunks": chunk_meta,
             "timing_note": timing_note,
             "text": full_text,
