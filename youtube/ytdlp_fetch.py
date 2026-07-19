@@ -15,6 +15,26 @@ def _require_yt_dlp():
     return yt_dlp
 
 
+def base_ydl_opts(
+    *,
+    cookies: str | Path | None = None,
+    quiet: bool = True,
+) -> dict[str, Any]:
+    """公共 yt-dlp 选项：cookies + Node JS challenge 解算（否则常无音轨/字幕）。"""
+    opts: dict[str, Any] = {
+        "quiet": quiet,
+        "no_warnings": quiet,
+        "ignore_no_formats_error": True,
+        "noplaylist": True,
+        # YouTube n-challenge：需要 JS runtime + ejs 组件
+        "js_runtimes": {"node": {}},
+        "remote_components": {"ejs:github"},
+    }
+    if cookies:
+        opts["cookiefile"] = str(cookies)
+    return opts
+
+
 def list_caption_langs(
     url: str,
     *,
@@ -26,15 +46,8 @@ def list_caption_langs(
     }
     """
     yt_dlp = _require_yt_dlp()
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "ignore_no_formats_error": True,
-        "noplaylist": True,
-    }
-    if cookies:
-        opts["cookiefile"] = str(cookies)
+    opts: dict[str, Any] = base_ydl_opts(cookies=cookies)
+    opts["skip_download"] = True
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     manual = sorted((info.get("subtitles") or {}).keys())
@@ -63,20 +76,17 @@ def download_captions(
     yt_dlp = _require_yt_dlp()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    opts: dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "ignore_no_formats_error": True,
-        "noplaylist": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": list(langs),
-        "subtitlesformat": prefer_ext,
-        "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
-    }
-    if cookies:
-        opts["cookiefile"] = str(cookies)
+    opts: dict[str, Any] = base_ydl_opts(cookies=cookies)
+    opts.update(
+        {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": list(langs),
+            "subtitlesformat": prefer_ext,
+            "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
+        }
+    )
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)

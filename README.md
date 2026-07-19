@@ -209,6 +209,25 @@ python -m youtube.cli "URL" --cookies /path/to/cookies.txt -o ./out/youtube
 pytest tests/test_youtube_captions.py -q
 ```
 
+### 频道最近 N 视频（元数据 + 字幕/Whisper）
+
+对频道页抓最近 N 条：标题/简介（原文+简体）+ 正文转写：
+
+1. 有**简体字幕** → 下载简体 txt/srt  
+2. 有**英文字幕** → 英文 txt/srt + 译简体  
+3. **都没有** → 下音频 → Whisper → 译简体（用完删音频）
+
+```bash
+chmod +x run_youtube_channel.sh
+
+./run_youtube_channel.sh "https://www.youtube.com/@AIsuperdomain" \
+  --limit 5 \
+  --cookies /root/Desktop/www.youtube.com_cookies.txt \
+  -o ./out/channel_AIsuperdomain
+```
+
+公共逻辑：`common/translate_cues.py`（cue 翻译）、`youtube/audio_whisper.py`（音频 Whisper）。
+
 ## 数据集模块：GigaSpeech 增量流水线
 
 面向 [speechcolab/gigaspeech](https://huggingface.co/datasets/speechcolab/gigaspeech)，**不整库下载**：

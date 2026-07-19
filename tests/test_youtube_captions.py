@@ -106,7 +106,7 @@ def test_parse_srt_zh_fixture():
 
 def test_translate_path_invokes_existing_translator(monkeypatch):
     """确保 EN 路径调用现有 translate_segments，而非自造翻译逻辑。"""
-    from youtube import pipeline as pl
+    from common.translate_cues import translate_cues
     from youtube.captions import Cue
 
     calls: list = []
@@ -122,8 +122,24 @@ def test_translate_path_invokes_existing_translator(monkeypatch):
             return out
 
     cues = [Cue(0.0, 1.0, "Hello"), Cue(1.0, 2.0, "World")]
-    zh = pl._translate_cues(cues, FakeTranslator(), workers=1, quiet=True)
+    zh = translate_cues(
+        cues,
+        FakeTranslator(),
+        workers=1,
+        quiet=True,
+        cue_factory=lambda s, e, t: Cue(s, e, t),
+    )
     assert len(calls) == 1
     assert calls[0][0]["text"] == "Hello"
     assert zh[0].text == "译:Hello"
     assert zh[1].text == "译:World"
+
+
+def test_segments_to_cues_estimated():
+    from youtube.audio_whisper import segments_to_cues
+
+    segs = [{"text": "Hello"}, {"text": "World"}]
+    cues = segments_to_cues(segs, duration=10.0)
+    assert len(cues) == 2
+    assert cues[0].text == "Hello"
+    assert cues[-1].end <= 10.0 + 1e-6

@@ -1,4 +1,4 @@
-"""YouTube URL → 简体字幕/文本流水线。"""
+"""YouTube 单视频：字幕优先，否则音频 Whisper → 简体。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any, Callable
 
 from youtube.captions import (
     Cue,
-    CaptionTrack,
     cues_to_plain_text,
     cues_to_srt,
     parse_subtitle_file,
@@ -26,37 +25,15 @@ if str(_ROOT) not in sys.path:
 
 @dataclass
 class YoutubeProcessResult:
-    mode: str  # zh-Hans | en | none
+    mode: str  # zh-Hans | en | whisper | none
     video_id: str
     title: str
     chosen_lang: str | None
     outputs: dict[str, Path] = field(default_factory=dict)
     error: str | None = None
-
-
-def _translate_cues(
-    cues: list[Cue],
-    translator: Any,
-    *,
-    workers: int = 4,
-    quiet: bool = False,
-) -> list[Cue]:
-    """用现有 translate 模块按 cue 译成中文。"""
-    if not cues:
-        return []
-    segs = [{"text": c.text, "i": i} for i, c in enumerate(cues)]
-    translated = translator.translate_segments(
-        segs,
-        text_key="text",
-        out_key="text_zh",
-        workers=max(1, workers),
-        quiet=quiet,
-    )
-    out: list[Cue] = []
-    for c, t in zip(cues, translated):
-        zh = (t.get("text_zh") or "").strip() or c.text
-        out.append(Cue(start=c.start, end=c.end, text=zh))
-    return out
+    description: str = ""
+    description_zh: str = ""
+    title_zh: str = ""
 
 
 def process_youtube_url(
@@ -65,14 +42,22 @@ def process_youtube_url(
     *,
     cookies: str | Path | None = None,
     translator: Any | None = None,
+    riva_client: Any | None = None,
+    asr_pool: Any | None = None,
     translate_workers: int = 4,
+    whisper_workers: int = 8,
+    language_code: str = "en-US",
+    fallback_audio: bool = True,
+    keep_audio: bool = False,
     quiet: bool = False,
     log: Callable[[str], None] | None = None,
+    prefetched_meta: dict[str, Any] | None = None,
 ) -> YoutubeProcessResult:
     """
     主流程：
-    - 有简体字幕 → 下简体 + 简体 txt
-    - 否则有英文 → 下英文 + 英文 txt + 译简体 srt + 简体 txt
+    1. 有简体字幕 → 下简体 + 简体 txt/srt
+    2. 有英文字幕 → 英文 txt/srt + 译简体
+    3. 都没有且 fallback_audio → 下音频 Whisper + 译简体
     """
 
     def _log(msg: str) -> None:
@@ -86,106 +71,164 @@ def process_youtube_url(
     work = out_dir / "_subs_raw"
     work.mkdir(parents=True, exist_ok=True)
 
-    meta = list_caption_langs(url, cookies=cookies)
-    video_id = meta["id"] or "unknown"
-    title = meta["title"] or video_id
+    if prefetched_meta:
+        meta = prefetched_meta
+    else:
+        meta = list_caption_langs(url, cookies=cookies)
+
+    video_id = meta.get("id") or "unknown"
+    title = meta.get("title") or video_id
     stem = safe_stem(title, video_id)
     dump_lang_list_json(meta, out_dir / f"{stem}.langs.json")
 
-    mode, track = pick_caption_track(meta["manual"], meta["auto"])
-    if mode == "none" or track is None:
+    mode, track = pick_caption_track(meta.get("manual") or [], meta.get("auto") or [])
+
+    # —— 路径 A/B：字幕 ——
+    if mode != "none" and track is not None:
+        _log(f"视频: {title} ({video_id})")
+        _log(f"选择字幕: {track.lang} ({track.kind}) → 路径 {mode}")
+
+        files = download_captions(
+            url,
+            work,
+            [track.lang],
+            cookies=cookies,
+            prefer_ext="vtt",
+        )
+        if track.lang not in files:
+            _log(f"字幕下载失败: {track.lang}，尝试音频回退…")
+            mode = "none"
+            track = None
+        else:
+            src_path = files[track.lang]
+            cues = parse_subtitle_file(src_path)
+            plain = strip_to_plain_text(cues_to_plain_text(cues))
+            outputs: dict[str, Path] = {}
+
+            raw_copy = out_dir / f"{stem}.{track.lang}{src_path.suffix}"
+            raw_copy.write_bytes(src_path.read_bytes())
+            outputs["source_sub"] = raw_copy
+
+            if mode == "zh-Hans":
+                zh_txt = out_dir / f"{stem}.zh.txt"
+                zh_txt.write_text(
+                    plain if plain.endswith("\n") else plain + "\n", encoding="utf-8"
+                )
+                outputs["zh_txt"] = zh_txt
+                zh_srt = out_dir / f"{stem}.zh.srt"
+                zh_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+                outputs["zh_srt"] = zh_srt
+                _log(f"已写简体文本: {zh_txt}")
+                return YoutubeProcessResult(
+                    mode=mode,
+                    video_id=video_id,
+                    title=title,
+                    chosen_lang=track.lang,
+                    outputs=outputs,
+                )
+
+            # EN captions
+            en_txt = out_dir / f"{stem}.en.txt"
+            en_txt.write_text(
+                plain if plain.endswith("\n") else plain + "\n", encoding="utf-8"
+            )
+            outputs["en_txt"] = en_txt
+            en_srt = out_dir / f"{stem}.en.srt"
+            en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+            outputs["en_srt"] = en_srt
+            _log(f"已写英文文本: {en_txt}")
+
+            if translator is None:
+                return YoutubeProcessResult(
+                    mode=mode,
+                    video_id=video_id,
+                    title=title,
+                    chosen_lang=track.lang,
+                    outputs=outputs,
+                    error="需要翻译器才能生成简体中文（未提供 translator）",
+                )
+
+            _log("正在英→简体翻译字幕…")
+            from common.translate_cues import translate_cues
+
+            zh_cues = translate_cues(
+                cues,
+                translator,
+                workers=translate_workers,
+                quiet=quiet,
+                cue_factory=lambda s, e, t: Cue(s, e, t),
+            )
+            zh_srt = out_dir / f"{stem}.zh.srt"
+            zh_srt.write_text(cues_to_srt(zh_cues), encoding="utf-8")
+            outputs["zh_srt"] = zh_srt
+            zh_plain = strip_to_plain_text(cues_to_plain_text(zh_cues))
+            zh_txt = out_dir / f"{stem}.zh.txt"
+            zh_txt.write_text(
+                zh_plain if zh_plain.endswith("\n") else zh_plain + "\n", encoding="utf-8"
+            )
+            outputs["zh_txt"] = zh_txt
+            _log(f"已写简体字幕: {zh_srt}")
+            _log(f"已写简体文本: {zh_txt}")
+            return YoutubeProcessResult(
+                mode=mode,
+                video_id=video_id,
+                title=title,
+                chosen_lang=track.lang,
+                outputs=outputs,
+            )
+
+    # —— 路径 C：无字幕 → 音频 Whisper ——
+    if not fallback_audio:
         return YoutubeProcessResult(
             mode="none",
             video_id=video_id,
             title=title,
             chosen_lang=None,
-            error="未找到简体中文或英文字幕",
+            error="未找到简体/英文字幕，且未启用音频回退",
         )
+
+    if riva_client is None or asr_pool is None:
+        return YoutubeProcessResult(
+            mode="none",
+            video_id=video_id,
+            title=title,
+            chosen_lang=None,
+            error="未找到字幕，且未配置 Whisper（riva_client/asr_pool）",
+        )
+
+    from youtube.audio_whisper import process_audio_fallback
 
     _log(f"视频: {title} ({video_id})")
-    _log(f"选择字幕: {track.lang} ({track.kind}) → 路径 {mode}")
-
-    files = download_captions(
-        url,
-        work,
-        [track.lang],
-        cookies=cookies,
-        prefer_ext="vtt",
-    )
-    if track.lang not in files:
+    try:
+        outputs = process_audio_fallback(
+            url,
+            out_dir,
+            stem=stem,
+            video_id=video_id,
+            cookies=cookies,
+            riva_client=riva_client,
+            pool=asr_pool,
+            translator=translator,
+            language_code=language_code,
+            translate_workers=translate_workers,
+            whisper_workers=whisper_workers,
+            quiet=quiet,
+            log=_log,
+            keep_audio=keep_audio,
+        )
+    except Exception as e:
         return YoutubeProcessResult(
-            mode=mode,
+            mode="whisper",
             video_id=video_id,
             title=title,
-            chosen_lang=track.lang,
-            error=f"字幕下载失败: {track.lang}",
+            chosen_lang=None,
+            error=f"音频 Whisper 失败: {type(e).__name__}: {e}",
         )
-
-    src_path = files[track.lang]
-    cues = parse_subtitle_file(src_path)
-    # .txt 只要台词：无 00:00:00 --> 时间轴、无序号
-    plain = strip_to_plain_text(cues_to_plain_text(cues))
-    outputs: dict[str, Path] = {}
-
-    # 保留原始字幕副本到 out_dir
-    raw_copy = out_dir / f"{stem}.{track.lang}{src_path.suffix}"
-    raw_copy.write_bytes(src_path.read_bytes())
-    outputs["source_sub"] = raw_copy
-
-    if mode == "zh-Hans":
-        zh_txt = out_dir / f"{stem}.zh.txt"
-        zh_txt.write_text(plain if plain.endswith("\n") else plain + "\n", encoding="utf-8")
-        outputs["zh_txt"] = zh_txt
-        # 若源是 vtt，额外给一份 srt 方便挂载
-        zh_srt = out_dir / f"{stem}.zh.srt"
-        zh_srt.write_text(cues_to_srt(cues), encoding="utf-8")
-        outputs["zh_srt"] = zh_srt
-        _log(f"已写简体文本: {zh_txt}")
-        return YoutubeProcessResult(
-            mode=mode,
-            video_id=video_id,
-            title=title,
-            chosen_lang=track.lang,
-            outputs=outputs,
-        )
-
-    # EN path
-    en_txt = out_dir / f"{stem}.en.txt"
-    en_txt.write_text(plain if plain.endswith("\n") else plain + "\n", encoding="utf-8")
-    outputs["en_txt"] = en_txt
-    en_srt = out_dir / f"{stem}.en.srt"
-    en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
-    outputs["en_srt"] = en_srt
-    _log(f"已写英文文本: {en_txt}")
-
-    if translator is None:
-        return YoutubeProcessResult(
-            mode=mode,
-            video_id=video_id,
-            title=title,
-            chosen_lang=track.lang,
-            outputs=outputs,
-            error="需要翻译器才能生成简体中文（未提供 translator）",
-        )
-
-    _log("正在英→简体翻译字幕…")
-    zh_cues = _translate_cues(
-        cues, translator, workers=translate_workers, quiet=quiet
-    )
-    zh_srt = out_dir / f"{stem}.zh.srt"
-    zh_srt.write_text(cues_to_srt(zh_cues), encoding="utf-8")
-    outputs["zh_srt"] = zh_srt
-    zh_txt = out_dir / f"{stem}.zh.txt"
-    zh_plain = strip_to_plain_text(cues_to_plain_text(zh_cues))
-    zh_txt.write_text(zh_plain if zh_plain.endswith("\n") else zh_plain + "\n", encoding="utf-8")
-    outputs["zh_txt"] = zh_txt
-    _log(f"已写简体字幕: {zh_srt}")
-    _log(f"已写简体文本: {zh_txt}")
 
     return YoutubeProcessResult(
-        mode=mode,
+        mode="whisper",
         video_id=video_id,
         title=title,
-        chosen_lang=track.lang,
+        chosen_lang="whisper",
         outputs=outputs,
     )

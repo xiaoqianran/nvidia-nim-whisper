@@ -76,6 +76,39 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             print(f"警告: 翻译器未就绪（{e}），将仅保存已下载字幕/英文", file=sys.stderr)
 
+    # 无字幕时 Whisper 回退
+    riva_client = None
+    asr_pool = None
+    try:
+        from transcribe_whisper_nvidia import (
+            DEFAULT_FUNCTION_ID,
+            DEFAULT_RATE_LIMIT,
+            DEFAULT_RATE_WINDOW_SEC,
+            DEFAULT_SERVER,
+            NvidiaApiKeyPool,
+            import_riva,
+            load_nvidia_api_keys,
+        )
+        import os
+
+        keys = load_nvidia_api_keys(cli_key=None, cli_keys=None, keys_file=None)
+        if keys:
+            riva_client = import_riva()
+            asr_pool = NvidiaApiKeyPool(
+                keys,
+                riva_client=riva_client,
+                server=DEFAULT_SERVER,
+                function_id=DEFAULT_FUNCTION_ID,
+                max_mb=128,
+                rate_limit=int(os.environ.get("WHISPER_RATE_LIMIT") or DEFAULT_RATE_LIMIT),
+                rate_window_sec=float(
+                    os.environ.get("WHISPER_RATE_WINDOW_SEC") or DEFAULT_RATE_WINDOW_SEC
+                ),
+            )
+    except Exception as e:
+        if not args.quiet:
+            print(f"提示: Whisper 回退未启用（{e}）", file=sys.stderr)
+
     cookies = args.cookies.expanduser() if args.cookies else None
     if cookies and not cookies.is_file():
         print(f"错误: cookies 文件不存在: {cookies}", file=sys.stderr)
@@ -87,7 +120,10 @@ def main(argv: list[str] | None = None) -> int:
             args.out_dir.expanduser().resolve(),
             cookies=cookies,
             translator=translator,
+            riva_client=riva_client,
+            asr_pool=asr_pool,
             translate_workers=args.translate_workers,
+            fallback_audio=True,
             quiet=args.quiet,
         )
     except Exception as e:
