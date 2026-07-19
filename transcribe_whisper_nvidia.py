@@ -5,20 +5,23 @@
 单文件分段：将整段音频切成固定时长的 chunk，默认并行调用 API
 （滑动窗口限速 40 次/分钟），再按时间偏移合并文本 / JSON / SRT。
 
+可选：OpenAI 兼容 Chat Completions 翻译模块（translate_openai.py），
+将转写结果译成中文等目标语言（Whisper 自带 translate 仅能到英文）。
+
 依赖:
   - ffmpeg / ffprobe
   - nvidia-riva-client（见 requirements.txt）
 
 API Key（任选其一，勿提交到 Git）:
   export NVIDIA_API_KEY='nvapi-...'
+  翻译另需: export OPENAI_API_KEY=... OPENAI_BASE_URL=... OPENAI_MODEL=...
   或在项目根目录放置 .env（见 .env.example）
-  或: python transcribe_whisper_nvidia.py media.mp3 --api-key nvapi-...
 
 用法:
   python transcribe_whisper_nvidia.py audio.mp3
-  python transcribe_whisper_nvidia.py audio.mp3 --chunk-seconds 30
-  python transcribe_whisper_nvidia.py video.mp4 -o out --language en-US --chunk-seconds 60
-  ./transcribe.sh audio.mp3 --chunk-seconds 45 --overlap-seconds 1
+  python transcribe_whisper_nvidia.py audio.mp3 --translate
+  python transcribe_whisper_nvidia.py audio.mp3 --translate --to zh-CN
+  ./transcribe.sh audio.mp3 --chunk-seconds 45 --translate
 """
 
 from __future__ import annotations
@@ -815,6 +818,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="请求词级时间戳（API 可能不返回）",
     )
+    # —— 翻译（OpenAI 兼容）——
+    p.add_argument(
+        "--translate",
+        action="store_true",
+        help="转写后用 OpenAI 兼容接口翻译（默认目标简体中文）",
+    )
+    p.add_argument(
+        "--to",
+        dest="translate_to",
+        default=None,
+        help="翻译目标语言，默认 zh-CN / TRANSLATE_TO",
+    )
+    p.add_argument(
+        "--openai-api-key",
+        default=None,
+        help="翻译 API Key；默认 OPENAI_API_KEY / LLM_API_KEY",
+    )
+    p.add_argument(
+        "--openai-base-url",
+        default=None,
+        help="OpenAI 兼容 base URL，如 https://api.openai.com/v1",
+    )
+    p.add_argument(
+        "--openai-model",
+        default=None,
+        help="翻译模型名，如 gpt-4o-mini",
+    )
+    p.add_argument(
+        "--translate-workers",
+        type=int,
+        default=4,
+        help="按字幕片段并行翻译的线程数",
+    )
+    p.add_argument(
+        "--translate-only-zh-outputs",
+        action="store_true",
+        help="开启翻译时，SRT/TXT 默认只写中文文件（仍保留原文 txt/json 中的 text 字段）",
+    )
     p.add_argument("-q", "--quiet", action="store_true", help="减少日志")
     return p.parse_args(argv)
 
@@ -924,16 +965,69 @@ def main(argv: list[str] | None = None) -> int:
     elif any(s.get("timing") == "estimated" for s in segments):
         timing_note = "部分片段时间戳为估算"
 
+    # —— 可选：OpenAI 兼容翻译 ——
+    full_text_zh: str | None = None
+    translation_meta: dict[str, Any] | None = None
+    if args.translate:
+        try:
+            from translate_openai import OpenAICompatTranslator
+        except ImportError:
+            # 同目录导入
+            sys.path.insert(0, str(script_dir))
+            from translate_openai import OpenAICompatTranslator  # type: ignore
+
+        try:
+            translator = OpenAICompatTranslator.from_env(
+                api_key=args.openai_api_key,
+                base_url=args.openai_base_url,
+                model=args.openai_model,
+                target=args.translate_to,
+            )
+        except ValueError as e:
+            die(str(e) + "\n  翻译需设置 OPENAI_API_KEY（及可选 OPENAI_BASE_URL / OPENAI_MODEL）")
+
+        if not args.quiet:
+            print(
+                f"正在翻译 → {translator.config.target} "
+                f"| model={translator.config.model} "
+                f"| base={translator.config.base_url}",
+                flush=True,
+            )
+        t1 = time.time()
+        full_text_zh, segments = translator.translate_segments_as_text_list(
+            segments,
+            text_key="text",
+            out_key="text_zh",
+            workers=max(1, args.translate_workers),
+            quiet=args.quiet,
+        )
+        # 无分段时退回整篇翻译
+        if not full_text_zh and full_text:
+            full_text_zh = translator.translate(full_text)
+        translation_meta = {
+            "target": translator.config.target,
+            "model": translator.config.model,
+            "base_url": translator.config.base_url,
+            "workers": args.translate_workers,
+            "elapsed_sec": round(time.time() - t1, 3),
+        }
+        if not args.quiet:
+            print(f"翻译完成，耗时 {translation_meta['elapsed_sec']:.1f} s", flush=True)
+
     written: list[Path] = []
 
     if not args.no_txt:
         txt_path = out_dir / f"{stem}_transcript.txt"
         txt_path.write_text(full_text + "\n", encoding="utf-8")
         written.append(txt_path)
+        if full_text_zh is not None:
+            zh_txt = out_dir / f"{stem}_transcript.zh.txt"
+            zh_txt.write_text(full_text_zh + "\n", encoding="utf-8")
+            written.append(zh_txt)
 
     if not args.no_json:
         json_path = out_dir / f"{stem}_transcript.json"
-        payload = {
+        payload: dict[str, Any] = {
             "model": "openai/whisper-large-v3",
             "source": str(input_path),
             "language": args.language,
@@ -948,23 +1042,48 @@ def main(argv: list[str] | None = None) -> int:
             "text": full_text,
             "segments": segments,
         }
+        if full_text_zh is not None:
+            payload["text_zh"] = full_text_zh
+            payload["translation"] = translation_meta
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         written.append(json_path)
 
     if not args.no_srt:
-        srt_path = out_dir / f"{stem}.srt"
-        n = write_srt(srt_path, segments, duration)
-        written.append(srt_path)
-        if not args.quiet:
-            print(f"SRT 字幕条数: {n}" + ("（时间戳含估算）" if timing_note else ""))
+        # 原文 SRT（除非只要中文输出且开启了 translate-only 风格——仍写原文轨便于对照）
+        if not (args.translate and args.translate_only_zh_outputs):
+            srt_path = out_dir / f"{stem}.srt"
+            n = write_srt(srt_path, segments, duration)
+            written.append(srt_path)
+            if not args.quiet:
+                print(f"SRT 字幕条数: {n}" + ("（时间戳含估算）" if timing_note else ""))
+        if full_text_zh is not None:
+            # 用 text_zh 覆盖 text 写中文字幕轨
+            zh_segments = []
+            for s in segments:
+                ns = dict(s)
+                if ns.get("text_zh"):
+                    ns["text"] = ns["text_zh"]
+                # 词级英文时间戳对中文无意义，清掉以免 SRT 用词级英文
+                ns["words"] = []
+                zh_segments.append(ns)
+            zh_srt = out_dir / f"{stem}.zh.srt"
+            n_zh = write_srt(zh_srt, zh_segments, duration)
+            written.append(zh_srt)
+            if not args.quiet:
+                print(f"中文 SRT 字幕条数: {n_zh}")
 
     if not args.quiet:
         print(f"字数约: {len(full_text.split())} 词 / {len(full_text)} 字符")
+        if full_text_zh is not None:
+            print(f"译文约: {len(full_text_zh)} 字符")
         print("已写入:")
         for p in written:
             print(f"  - {p}")
-        print("--- 预览（前 400 字）---")
+        print("--- 原文预览（前 400 字）---")
         print(full_text[:400] + ("…" if len(full_text) > 400 else ""))
+        if full_text_zh:
+            print("--- 译文预览（前 400 字）---")
+            print(full_text_zh[:400] + ("…" if len(full_text_zh) > 400 else ""))
 
     return 0
 

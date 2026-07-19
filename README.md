@@ -2,11 +2,14 @@
 
 通过 [NVIDIA build.nvidia.com](https://build.nvidia.com/openai/whisper-large-v3) 托管的 **OpenAI Whisper Large V3**（NIM / Riva gRPC）转录本地音视频，输出：
 
-- `*_transcript.txt` — 纯文本
+- `*_transcript.txt` — 纯文本（原文）
 - `*_transcript.json` — 分段 + 元数据
 - `*.srt` — 字幕（无词级时间戳时按比例估算）
+- 可选 `--translate`：`*_transcript.zh.txt` / `*.zh.srt`（OpenAI 兼容 LLM 译成中文等）
 
 模型页: https://build.nvidia.com/openai/whisper-large-v3/api
+
+> Whisper 自带 `task=translate` **只能译成英文**。要中文请用本仓库的 **OpenAI 兼容翻译模块**。
 
 ## 依赖
 
@@ -46,6 +49,7 @@ export NVIDIA_API_KEY='nvapi-...'
 ```bash
 cp .env.example .env
 # 编辑 .env，填入 NVIDIA_API_KEY=nvapi-...
+# 若需要翻译，再填 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
 ```
 
 `.env` 已在 `.gitignore` 中，不会被提交。
@@ -58,6 +62,22 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 
 优先级：`--api-key` > 已 export 的环境变量 > `.env`。
 
+### 4. 翻译（OpenAI 兼容）
+
+```bash
+export OPENAI_API_KEY='sk-...'
+export OPENAI_BASE_URL='https://api.openai.com/v1'   # 任意兼容端点
+export OPENAI_MODEL='gpt-4o-mini'
+
+./transcribe.sh talk.mp3 --translate
+./transcribe.sh talk.mp3 --translate --to zh-CN --translate-workers 4
+
+# 仅测翻译模块
+python translate_openai.py --text "Hello, Spring Boot"
+python translate_openai.py -i out_transcript.txt -o out_transcript.zh.txt
+```
+
+任意兼容 `POST /v1/chat/completions` 的服务均可（OpenAI、Azure OpenAI、vLLM、OneAPI、NVIDIA integrate.api 等）。
 ## 使用
 
 ```bash
@@ -119,8 +139,20 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `--rate-limit` | 滑动窗口最大请求数，默认 `40`；`0`=关闭 |
 | `--rate-window-sec` | 限速窗口秒数，默认 `60` |
 | `--keep-chunks` | 保留 `*_chunks/` 下分段 WAV |
+| `--translate` | 转写后翻译（需 OpenAI 兼容 Key） |
+| `--to` | 目标语言，默认 `zh-CN` |
+| `--openai-base-url` / `--openai-model` / `--openai-api-key` | 翻译端点 |
+| `--translate-workers` | 按片段并行翻译线程数，默认 4 |
 
 > 串行分段通常不比「整段一次」更快；**并行 + 限速** 才能明显缩短墙钟时间（受 API 并发与配额约束）。
+
+翻译产物：
+
+| 文件 | 内容 |
+|------|------|
+| `*_transcript.txt` / `*.srt` | 原文（Whisper） |
+| `*_transcript.zh.txt` / `*.zh.srt` | 译文 |
+| `*_transcript.json` | 含 `text`、`text_zh`、`segments[].text_zh` |
 
 ## 许可与条款
 
