@@ -177,6 +177,38 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `*_transcript.zh.txt` / `*.zh.srt` | 译文 |
 | `*_transcript.json` | 含 `text`、`text_zh`、`segments[].text_zh` |
 
+## YouTube 字幕模块（yt-dlp）
+
+给定视频链接：
+
+1. **有简体中文字幕**（`zh-Hans` / `zh-CN` 等）→ 下载简体字幕 + 写出 `*.zh.txt`（及 `*.zh.srt`）  
+2. **没有简体、有英文** → 下载英文 → `*.en.txt` / `*.en.srt`，再用现有 **NVIDIA 翻译库** 生成 `*.zh.srt` + `*.zh.txt`  
+3. **不下载整段视频**；可用 cookies 提高成功率  
+
+```bash
+# 依赖: pip install yt-dlp
+chmod +x run_youtube.sh
+
+./run_youtube.sh "https://www.youtube.com/watch?v=VIDEO_ID" \
+  --cookies /root/Desktop/www.youtube.com_cookies.txt \
+  -o ./out/youtube
+
+# 或
+python -m youtube.cli "URL" --cookies /path/to/cookies.txt -o ./out/youtube
+```
+
+输出示例：
+
+- 简体路径：`标题_ID.zh.txt`、`标题_ID.zh.srt`  
+- 英文路径：`标题_ID.en.txt`、`标题_ID.en.srt`、`标题_ID.zh.txt`、`标题_ID.zh.srt`  
+- `标题_ID.langs.json`：可用语言列表  
+
+单元测试（无网络）：
+
+```bash
+pytest tests/test_youtube_captions.py -q
+```
+
 ## 数据集模块：GigaSpeech 增量流水线
 
 面向 [speechcolab/gigaspeech](https://huggingface.co/datasets/speechcolab/gigaspeech)，**不整库下载**：
