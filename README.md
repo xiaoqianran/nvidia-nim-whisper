@@ -82,16 +82,38 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `--env-file PATH` | 指定 `.env` 路径 |
 | `-q` | 安静模式 |
 
-## 工作原理
+## 单文件分段
 
-当前实现为 **串行、整段 offline 识别**：
+默认将**单个**音视频按时间切成多段，再 **串行** 调 API（`--workers 1`）：
 
-1. `ffmpeg` 将输入转为 16 kHz 单声道 PCM WAV  
-2. 通过 gRPC 一次请求 `grpc.nvcf.nvidia.com:443`  
-3. metadata：`function-id` + `authorization: Bearer <API_KEY>`  
-4. 写出 txt / json / srt  
+1. `ffmpeg` 转为 16 kHz 单声道 PCM WAV  
+2. 按 `--chunk-seconds`（默认 30s）切 chunk，可选 `--overlap-seconds` 重叠  
+3. 逐段 gRPC `offline_recognize`（`workers>1` 时线程池并行）  
+4. 按 chunk 起始时间偏移合并文本 / JSON / SRT  
 
-不适合超长文件时，可能受 gRPC 消息大小与超时限制；可按需自行分片。
+```bash
+# 默认：30 秒一片，串行
+./transcribe.sh talk.mp3
+
+# 60 秒一片，边界重叠 1 秒
+./transcribe.sh talk.mp3 --chunk-seconds 60 --overlap-seconds 1
+
+# 不切分（整段一次请求）
+./transcribe.sh talk.mp3 --chunk-seconds 0
+
+# 并行 3 路请求（仍是单文件多 chunk）
+./transcribe.sh talk.mp3 --chunk-seconds 30 --workers 3
+
+# 保留分段 WAV 便于调试
+./transcribe.sh talk.mp3 --keep-chunks
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--chunk-seconds` | 每段时长（秒），`<=0` 关闭分段 |
+| `--overlap-seconds` | 相邻段重叠，减轻边界吞字 |
+| `--workers` | `1` 串行（默认）；`>1` 并行请求 |
+| `--keep-chunks` | 保留 `*_chunks/` 下分段 WAV |
 
 ## 许可与条款
 

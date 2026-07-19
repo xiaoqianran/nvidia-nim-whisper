@@ -2,6 +2,9 @@
 """
 使用 NVIDIA build.nvidia.com 托管的 OpenAI Whisper Large V3 转录音视频。
 
+单文件分段：将整段音频切成固定时长的 chunk，逐段（串行）调用 API，
+再按时间偏移合并文本 / JSON / SRT。
+
 依赖:
   - ffmpeg / ffprobe
   - nvidia-riva-client（见 requirements.txt）
@@ -9,24 +12,29 @@
 API Key（任选其一，勿提交到 Git）:
   export NVIDIA_API_KEY='nvapi-...'
   或在项目根目录放置 .env（见 .env.example）
-  或: python transcribe_whisper_nvidia.py media.mp4 --api-key nvapi-...
+  或: python transcribe_whisper_nvidia.py media.mp3 --api-key nvapi-...
 
 用法:
-  python transcribe_whisper_nvidia.py video.mp4
-  python transcribe_whisper_nvidia.py audio.wav -o out_dir --language en-US
-  ./transcribe.sh video.mp4 --keep-wav --no-srt
+  python transcribe_whisper_nvidia.py audio.mp3
+  python transcribe_whisper_nvidia.py audio.mp3 --chunk-seconds 30
+  python transcribe_whisper_nvidia.py video.mp4 -o out --language en-US --chunk-seconds 60
+  ./transcribe.sh audio.mp3 --chunk-seconds 45 --overlap-seconds 1
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +43,7 @@ from typing import Any
 DEFAULT_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
 DEFAULT_SERVER = "grpc.nvcf.nvidia.com:443"
 DEFAULT_SAMPLE_RATE = 16000
+DEFAULT_CHUNK_SECONDS = 30.0
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".flv", ".ts", ".mpeg", ".mpg"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".wma"}
@@ -71,7 +80,6 @@ def load_dotenv(paths: list[Path]) -> None:
                 value.startswith("'") and value.endswith("'")
             ):
                 value = value[1:-1]
-            # 已存在的环境变量优先（export 覆盖 .env）
             if key not in os.environ or os.environ.get(key) == "":
                 os.environ[key] = value
 
@@ -142,8 +150,7 @@ def extract_wav(input_path: Path, wav_path: Path, sample_rate: int = DEFAULT_SAM
         die(f"ffmpeg 失败:\n{e.stderr[-2000:] if e.stderr else e}")
 
 
-def ensure_wav(input_path: Path, work_dir: Path, sample_rate: int, keep_wav: bool) -> Path:
-    """转码为 16kHz mono WAV，返回路径。"""
+def ensure_wav(input_path: Path, work_dir: Path, sample_rate: int) -> Path:
     suffix = input_path.suffix.lower()
     if suffix not in VIDEO_EXTS | AUDIO_EXTS and suffix != ".wav":
         print(f"警告: 未识别扩展名 {suffix}，仍尝试用 ffmpeg 处理。", file=sys.stderr)
@@ -151,6 +158,99 @@ def ensure_wav(input_path: Path, work_dir: Path, sample_rate: int, keep_wav: boo
     wav_path = work_dir / f"{input_path.stem}_16k_mono.wav"
     extract_wav(input_path, wav_path, sample_rate)
     return wav_path
+
+
+def wav_duration_and_rate(wav_path: Path) -> tuple[float, int, int]:
+    """返回 (duration_sec, sample_rate, n_channels)。"""
+    with wave.open(str(wav_path), "rb") as w:
+        rate = w.getframerate()
+        nframes = w.getnframes()
+        channels = w.getnchannels()
+        duration = nframes / float(rate) if rate else 0.0
+        return duration, rate, channels
+
+
+@dataclass
+class AudioChunk:
+    index: int
+    start_sec: float
+    end_sec: float
+    path: Path
+
+
+def split_wav_chunks(
+    wav_path: Path,
+    chunk_dir: Path,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    sample_rate: int,
+) -> list[AudioChunk]:
+    """
+    将整段 WAV 按时间切成多个 chunk 文件（串行后续调用 API）。
+
+    chunk_seconds <= 0 时表示不切分，整文件作为一个 chunk。
+    """
+    duration, rate, channels = wav_duration_and_rate(wav_path)
+    if rate != sample_rate:
+        print(
+            f"警告: WAV 采样率 {rate} != 期望 {sample_rate}，仍按文件实际采样率切分。",
+            file=sys.stderr,
+        )
+        sample_rate = rate
+
+    if chunk_seconds <= 0 or duration <= chunk_seconds:
+        # 整段作为一个 chunk（可直接复用原 wav，避免多余拷贝）
+        return [
+            AudioChunk(
+                index=0,
+                start_sec=0.0,
+                end_sec=duration,
+                path=wav_path,
+            )
+        ]
+
+    if overlap_seconds < 0:
+        die("--overlap-seconds 不能为负")
+    if overlap_seconds >= chunk_seconds:
+        die("--overlap-seconds 必须小于 --chunk-seconds")
+
+    step = chunk_seconds - overlap_seconds
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    chunks: list[AudioChunk] = []
+    with wave.open(str(wav_path), "rb") as src:
+        sampwidth = src.getsampwidth()
+        n_channels = src.getnchannels()
+        assert n_channels == 1, "期望单声道 WAV"
+
+        idx = 0
+        start = 0.0
+        while start < duration - 1e-6:
+            end = min(duration, start + chunk_seconds)
+            start_frame = int(round(start * sample_rate))
+            end_frame = int(round(end * sample_rate))
+            n_frames = max(0, end_frame - start_frame)
+            if n_frames <= 0:
+                break
+
+            src.setpos(start_frame)
+            frames = src.readframes(n_frames)
+
+            out = chunk_dir / f"chunk_{idx:04d}_{start:.2f}-{end:.2f}.wav"
+            with wave.open(str(out), "wb") as dst:
+                dst.setnchannels(1)
+                dst.setsampwidth(sampwidth)
+                dst.setframerate(sample_rate)
+                dst.writeframes(frames)
+
+            chunks.append(AudioChunk(index=idx, start_sec=start, end_sec=end, path=out))
+            idx += 1
+
+            if end >= duration - 1e-6:
+                break
+            start += step
+
+    return chunks
 
 
 def build_asr_service(riva_client, api_key: str, server: str, function_id: str, max_mb: int):
@@ -226,6 +326,40 @@ def parse_response(resp) -> tuple[str, list[dict[str, Any]]]:
     return full_text, segments
 
 
+def shift_segments(segments: list[dict[str, Any]], offset_sec: float) -> list[dict[str, Any]]:
+    """把片段内相对时间平移到全局时间轴。"""
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        s = dict(seg)
+        words = []
+        for w in seg.get("words") or []:
+            nw = dict(w)
+            if nw.get("start") is not None:
+                try:
+                    nw["start"] = float(nw["start"]) + offset_sec
+                except (TypeError, ValueError):
+                    pass
+            if nw.get("end") is not None:
+                try:
+                    nw["end"] = float(nw["end"]) + offset_sec
+                except (TypeError, ValueError):
+                    pass
+            words.append(nw)
+        s["words"] = words
+        if s.get("start") is not None:
+            try:
+                s["start"] = float(s["start"]) + offset_sec
+            except (TypeError, ValueError):
+                pass
+        if s.get("end") is not None:
+            try:
+                s["end"] = float(s["end"]) + offset_sec
+            except (TypeError, ValueError):
+                pass
+        out.append(s)
+    return out
+
+
 def max_word_time(segments: list[dict[str, Any]]) -> float:
     m = 0.0
     for seg in segments:
@@ -237,25 +371,43 @@ def max_word_time(segments: list[dict[str, Any]]) -> float:
                         m = max(m, float(v))
                     except (TypeError, ValueError):
                         pass
+        for k in ("start", "end"):
+            v = seg.get(k)
+            if v is not None:
+                try:
+                    m = max(m, float(v))
+                except (TypeError, ValueError):
+                    pass
     return m
 
 
-def estimate_segment_times(segments: list[dict[str, Any]], duration: float | None) -> list[dict[str, Any]]:
-    """API 未返回词级时间戳时，按字符比例估算片段起止时间。"""
+def estimate_segment_times(
+    segments: list[dict[str, Any]],
+    duration: float | None,
+    window_start: float = 0.0,
+    window_end: float | None = None,
+) -> list[dict[str, Any]]:
+    """
+    API 未返回词级时间戳时，在 [window_start, window_end] 内按字符比例估算。
+    单文件分段场景下，每个 chunk 在自己的时间窗内估算，再合并。
+    """
     if not segments:
         return segments
     if max_word_time(segments) > 0:
         return segments
-    if not duration or duration <= 0:
+
+    end = window_end if window_end is not None else duration
+    if end is None or end <= window_start:
         return segments
 
+    span = end - window_start
     total_chars = sum(len(s.get("text") or "") for s in segments) or 1
-    t = 0.0
+    t = window_start
     for s in segments:
         n = len(s.get("text") or "")
-        dur = duration * (n / total_chars)
+        dur = span * (n / total_chars)
         s["start"] = round(t, 3)
-        s["end"] = round(min(duration, t + dur), 3)
+        s["end"] = round(min(end, t + dur), 3)
         s["timing"] = "estimated"
         t = s["end"]
     return segments
@@ -281,12 +433,11 @@ def write_srt(
     duration: float | None,
     max_line_chars: int = 72,
 ) -> int:
-    """写出 SRT。优先用词级时间；否则用估算的片段时间并按长度切行。"""
-    has_words = max_word_time(segments) > 0
+    """写出 SRT。优先用词级时间；否则用片段估算时间并按长度切行。"""
+    has_words = any((seg.get("words") or []) for seg in segments) and max_word_time(segments) > 0
     scale = 1.0
-    if has_words:
-        if duration and max_word_time(segments) > duration * 5:
-            scale = 0.001
+    if has_words and duration and max_word_time(segments) > duration * 5:
+        scale = 0.001
 
     cues: list[tuple[float, float, str]] = []
 
@@ -313,7 +464,10 @@ def write_srt(
                 end = float(chunk[-1]["end"] or 0) * scale
                 cues.append((chunk_start, end, text))
     else:
-        segs = estimate_segment_times([dict(s) for s in segments], duration)
+        segs = segments
+        # 若完全没有时间，整段按总时长估算
+        if max_word_time(segs) <= 0:
+            segs = estimate_segment_times([dict(s) for s in segments], duration, 0.0, duration)
         for s in segs:
             text = s.get("text") or ""
             start = float(s.get("start") or 0)
@@ -333,8 +487,10 @@ def write_srt(
             total = sum(len(c) for c in chunks) or 1
             t = start
             for c in chunks:
-                sub = (end - start) * (len(c) / total)
-                te = min(end, t + sub)
+                sub = (end - start) * (len(c) / total) if end > start else 0
+                te = min(end, t + sub) if end > start else end
+                if te <= t:
+                    te = t + 0.01
                 cues.append((t, te, c))
                 t = te
 
@@ -348,9 +504,148 @@ def default_out_stem(input_path: Path) -> str:
     return input_path.stem.replace(" ", "_")
 
 
+def transcribe_one_chunk(
+    riva_client,
+    asr,
+    chunk: AudioChunk,
+    language_code: str,
+    sample_rate: int,
+    word_offsets: bool,
+) -> tuple[AudioChunk, str, list[dict[str, Any]], float]:
+    """转录单个 chunk，返回 (chunk, text, segments_global, elapsed)."""
+    raw = chunk.path.read_bytes()
+    # Riva 的 LINEAR_PCM 期望原始 PCM；若传入完整 wav 容器，
+    # 部分实现可处理。为稳妥只送 data 部分：
+    pcm = _wav_to_pcm(chunk.path)
+
+    t0 = time.time()
+    resp = offline_transcribe(
+        riva_client,
+        asr,
+        pcm if pcm is not None else raw,
+        language_code=language_code,
+        sample_rate=sample_rate,
+        word_offsets=word_offsets,
+    )
+    elapsed = time.time() - t0
+    text, segs = parse_response(resp)
+
+    # 无词级时间：在 chunk 时间窗内估算
+    if segs and max_word_time(segs) <= 0:
+        segs = estimate_segment_times(segs, None, chunk.start_sec, chunk.end_sec)
+    else:
+        segs = shift_segments(segs, chunk.start_sec)
+        for s in segs:
+            s.setdefault("chunk_index", chunk.index)
+            s.setdefault("chunk_start", chunk.start_sec)
+            s.setdefault("chunk_end", chunk.end_sec)
+
+    for s in segs:
+        s["chunk_index"] = chunk.index
+        s["chunk_start"] = chunk.start_sec
+        s["chunk_end"] = chunk.end_sec
+
+    return chunk, text, segs, elapsed
+
+
+def _wav_to_pcm(wav_path: Path) -> bytes | None:
+    """读取 WAV 的 PCM 帧；失败返回 None。"""
+    try:
+        with wave.open(str(wav_path), "rb") as w:
+            return w.readframes(w.getnframes())
+    except wave.Error:
+        return None
+
+
+def run_chunks(
+    riva_client,
+    asr,
+    chunks: list[AudioChunk],
+    language_code: str,
+    sample_rate: int,
+    word_offsets: bool,
+    workers: int,
+    quiet: bool,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    对 chunk 列表做识别。
+
+    workers=1: 严格串行（默认）
+    workers>1: 线程池并行请求（仍按 index 合并结果）
+    """
+    results: dict[int, tuple[str, list[dict[str, Any]], float]] = {}
+    total = len(chunks)
+
+    def _work(ch: AudioChunk):
+        return transcribe_one_chunk(
+            riva_client, asr, ch, language_code, sample_rate, word_offsets
+        )
+
+    if workers <= 1:
+        for i, ch in enumerate(chunks, 1):
+            if not quiet:
+                print(
+                    f"[{i}/{total}] chunk#{ch.index} "
+                    f"{ch.start_sec:.1f}s–{ch.end_sec:.1f}s …",
+                    flush=True,
+                )
+            try:
+                chunk, text, segs, elapsed = _work(ch)
+            except Exception as e:
+                die(f"chunk#{ch.index} 转录失败: {type(e).__name__}: {e}")
+            results[chunk.index] = (text, segs, elapsed)
+            if not quiet:
+                preview = (text[:80] + "…") if len(text) > 80 else text
+                print(f"    完成 {elapsed:.1f}s | {preview}", flush=True)
+    else:
+        if not quiet:
+            print(f"并行 workers={workers}，共 {total} 个 chunk …", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_work, ch): ch for ch in chunks}
+            done = 0
+            for fut in as_completed(futs):
+                ch = futs[fut]
+                try:
+                    chunk, text, segs, elapsed = fut.result()
+                except Exception as e:
+                    die(f"chunk#{ch.index} 转录失败: {type(e).__name__}: {e}")
+                results[chunk.index] = (text, segs, elapsed)
+                done += 1
+                if not quiet:
+                    preview = (text[:80] + "…") if len(text) > 80 else text
+                    print(
+                        f"[{done}/{total}] chunk#{chunk.index} "
+                        f"{chunk.start_sec:.1f}s–{chunk.end_sec:.1f}s "
+                        f"完成 {elapsed:.1f}s | {preview}",
+                        flush=True,
+                    )
+
+    texts: list[str] = []
+    all_segments: list[dict[str, Any]] = []
+    chunk_meta: list[dict[str, Any]] = []
+    for ch in sorted(chunks, key=lambda c: c.index):
+        text, segs, elapsed = results[ch.index]
+        if text:
+            texts.append(text)
+        all_segments.extend(segs)
+        chunk_meta.append(
+            {
+                "index": ch.index,
+                "start_sec": ch.start_sec,
+                "end_sec": ch.end_sec,
+                "path": str(ch.path.name),
+                "elapsed_sec": round(elapsed, 3),
+                "chars": len(text),
+            }
+        )
+
+    full_text = " ".join(texts)
+    return full_text, all_segments, chunk_meta
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="NVIDIA Whisper Large V3 音视频转录（build.nvidia.com NIM）",
+        description="NVIDIA Whisper Large V3 音视频转录（单文件分段 + build.nvidia.com NIM）",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("input", type=Path, help="输入音视频文件路径")
@@ -391,7 +686,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=128,
         help="gRPC 单条消息上限（MB）",
     )
-    p.add_argument("--keep-wav", action="store_true", help="保留中间 WAV 文件")
+    p.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=DEFAULT_CHUNK_SECONDS,
+        help="单文件分段时长（秒）。<=0 表示不切分、整段一次请求",
+    )
+    p.add_argument(
+        "--overlap-seconds",
+        type=float,
+        default=0.0,
+        help="相邻 chunk 重叠秒数（减少边界吞字；合并时文本仍简单拼接）",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="并行请求线程数。1=串行（推荐）；>1 并行打 API",
+    )
+    p.add_argument("--keep-wav", action="store_true", help="保留中间整段 WAV")
+    p.add_argument("--keep-chunks", action="store_true", help="保留分段 WAV 文件")
     p.add_argument("--no-srt", action="store_true", help="不生成 SRT 字幕")
     p.add_argument("--no-json", action="store_true", help="不生成 JSON")
     p.add_argument("--no-txt", action="store_true", help="不生成纯文本")
@@ -428,6 +742,9 @@ def main(argv: list[str] | None = None) -> int:
             "  或传入 --api-key"
         )
 
+    if args.workers < 1:
+        die("--workers 至少为 1")
+
     out_dir = (args.output_dir or input_path.parent).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = args.stem or default_out_stem(input_path)
@@ -437,13 +754,34 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="whisper_nv_") as tmp:
         tmp_dir = Path(tmp)
-        work_dir = out_dir if args.keep_wav else tmp_dir
-        wav_path = ensure_wav(input_path, work_dir, args.sample_rate, keep_wav=args.keep_wav)
-        audio = wav_path.read_bytes()
+        wav_work = out_dir if args.keep_wav else tmp_dir
+        wav_path = ensure_wav(input_path, wav_work, args.sample_rate)
+
+        wav_dur, wav_rate, _ = wav_duration_and_rate(wav_path)
+        if duration is None:
+            duration = wav_dur
+
+        chunk_work = out_dir / f"{stem}_chunks" if args.keep_chunks else tmp_dir / "chunks"
+        chunks = split_wav_chunks(
+            wav_path,
+            chunk_work,
+            chunk_seconds=args.chunk_seconds,
+            overlap_seconds=args.overlap_seconds,
+            sample_rate=args.sample_rate,
+        )
+
         if not args.quiet:
-            print(f"音频大小: {len(audio) / 1e6:.2f} MB")
-            if duration:
-                print(f"时长约: {duration:.1f} s")
+            size_mb = wav_path.stat().st_size / 1e6
+            print(f"音频大小: {size_mb:.2f} MB | 时长约: {duration:.1f} s | 采样率: {wav_rate}")
+            if args.chunk_seconds <= 0:
+                print("分段: 关闭（整段一次请求）")
+            else:
+                print(
+                    f"分段: {len(chunks)} 片 × {args.chunk_seconds:g}s"
+                    f"（重叠 {args.overlap_seconds:g}s）"
+                    f" | workers={args.workers}"
+                    f" | {'并行' if args.workers > 1 else '串行'}"
+                )
 
         asr = build_asr_service(
             riva_client,
@@ -456,29 +794,28 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             print("正在调用 NVIDIA Whisper Large V3 …")
         t0 = time.time()
-        try:
-            resp = offline_transcribe(
-                riva_client,
-                asr,
-                audio,
-                language_code=args.language,
-                sample_rate=args.sample_rate,
-                word_offsets=args.word_offsets,
-            )
-        except Exception as e:
-            die(f"转录失败: {type(e).__name__}: {e}")
+        full_text, segments, chunk_meta = run_chunks(
+            riva_client,
+            asr,
+            chunks,
+            language_code=args.language,
+            sample_rate=args.sample_rate,
+            word_offsets=args.word_offsets,
+            workers=args.workers,
+            quiet=args.quiet,
+        )
         elapsed = time.time() - t0
         if not args.quiet:
-            print(f"完成，耗时 {elapsed:.1f} s")
+            print(f"全部完成，总耗时 {elapsed:.1f} s")
 
-    full_text, segments = parse_response(resp)
     if not full_text:
         die("未得到任何转写文本（空结果）")
 
     timing_note = None
     if max_word_time(segments) <= 0:
-        segments = estimate_segment_times(segments, duration)
-        timing_note = "片段 start/end 为按字符比例估算（API 未返回词级时间戳）"
+        timing_note = "时间戳为按各 chunk 时间窗内字符比例估算（API 未返回词级时间戳）"
+    elif any(s.get("timing") == "estimated" for s in segments):
+        timing_note = "部分片段时间戳为估算"
 
     written: list[Path] = []
 
@@ -494,6 +831,10 @@ def main(argv: list[str] | None = None) -> int:
             "source": str(input_path),
             "language": args.language,
             "duration_sec": duration,
+            "chunk_seconds": args.chunk_seconds,
+            "overlap_seconds": args.overlap_seconds,
+            "workers": args.workers,
+            "chunks": chunk_meta,
             "timing_note": timing_note,
             "text": full_text,
             "segments": segments,
@@ -506,7 +847,7 @@ def main(argv: list[str] | None = None) -> int:
         n = write_srt(srt_path, segments, duration)
         written.append(srt_path)
         if not args.quiet:
-            print(f"SRT 字幕条数: {n}" + ("（时间戳为估算）" if timing_note else ""))
+            print(f"SRT 字幕条数: {n}" + ("（时间戳含估算）" if timing_note else ""))
 
     if not args.quiet:
         print(f"字数约: {len(full_text.split())} 词 / {len(full_text)} 字符")
