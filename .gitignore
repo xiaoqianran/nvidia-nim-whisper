@@ -43,3 +43,7 @@ out/
 .vscode/
 *.swp
 *~
+
+# 允许测试用字幕 fixture
+!tests/fixtures/**/*.srt
+!tests/fixtures/**/*.vtt
