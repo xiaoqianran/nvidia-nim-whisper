@@ -91,7 +91,7 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 ```bash
 # nvidia_translate_api_keys.txt 每行一个 nvapi-...
 # OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
-# OPENAI_MODEL=meta/llama-3.1-8b-instruct
+# OPENAI_MODEL=mistralai/mistral-small-4-119b-2603
 # TRANSLATE_RATE_LIMIT=40   # 每 Key
 
 ./transcribe.sh talk.mp3 --translate

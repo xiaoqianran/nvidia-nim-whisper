@@ -9,7 +9,7 @@ OpenAI 兼容 Chat Completions 翻译模块（支持 NVIDIA 多 Key 负载均衡
   NVIDIA_TRANSLATE_API_KEYS / NVIDIA_TRANSLATE_API_KEYS_FILE  — 翻译专用多 Key
   OPENAI_API_KEY / OPENAI_API_KEYS / OPENAI_API_KEYS_FILE     — 兼容旧配置
   OPENAI_BASE_URL   默认 https://integrate.api.nvidia.com/v1
-  OPENAI_MODEL      默认 meta/llama-3.1-8b-instruct
+  OPENAI_MODEL      默认 mistralai/mistral-small-4-119b-2603
   TRANSLATE_TO      默认 zh-CN
   TRANSLATE_RATE_LIMIT         每 Key 限速，默认 40
   TRANSLATE_RATE_WINDOW_SEC    默认 60
@@ -40,7 +40,7 @@ from typing import Any, Callable
 
 # NVIDIA OpenAI 兼容网关
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_MODEL = "meta/llama-3.1-8b-instruct"
+DEFAULT_MODEL = "mistralai/mistral-small-4-119b-2603"
 DEFAULT_TARGET = "zh-CN"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_RETRIES = 4
