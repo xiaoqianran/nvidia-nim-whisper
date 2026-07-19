@@ -271,13 +271,20 @@ def main(argv: list[str] | None = None) -> int:
             sink.write(rec)
             ok += 1
             if not args.quiet:
-                prev = (rec.get("whisper_text") or "")[:60]
-                zh = (rec.get("text_zh") or "")[:40]
-                extra = f" | zh={zh}…" if zh else ""
+                en = (rec.get("whisper_text") or "").strip()
+                zh = (rec.get("text_zh") or "").strip()
+                en_show = en if len(en) <= 72 else en[:72] + "…"
                 print(
-                    f"  OK [{ok}] {sid} {rec.get('duration_sec')}s | {prev}…{extra}",
+                    f"  OK [{ok}] {sid}  {rec.get('duration_sec')}s",
                     flush=True,
                 )
+                if en_show:
+                    print(f"    en: {en_show}", flush=True)
+                if zh:
+                    # 中文完整输出，不截断
+                    print(f"    zh: {zh}", flush=True)
+                elif rec.get("whisper_text") and not args.translate:
+                    pass
             _maybe_cleanup(force=False)
 
     exit_code = 0
