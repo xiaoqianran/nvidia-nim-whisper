@@ -2,8 +2,11 @@
 文本总结（公共）：多 Key 限速 + 超长自动分块 map-reduce。
 
 默认模型 stepfun-ai/step-3.5-flash（NVIDIA integrate）。
-上下文：为稳妥按「输入约 24k 字符/块」切分（≈ 保守 6–8k tokens 级），
-避免顶满 NIM 上下文或网关 body 限制；最后再综合成一篇总结。
+官方上下文约 **262K tokens**（build.nvidia.com 标注 Context Length: 262K）。
+
+分块策略：默认按字符预算切分，优先单次送入；仅极长文稿才 map-reduce。
+字符→token 粗算（中文约 1.5–2 字/token）：180k 字 ≈ 90–120k tokens，
+仍远低于 262k，并预留 system/输出空间。可用 SUMMARIZE_MAX_CHUNK_CHARS 覆盖。
 """
 
 from __future__ import annotations
@@ -21,11 +24,11 @@ from common.llm_chat import (
     load_keys_from_env,
 )
 
-# stepfun-ai/step-3.5-flash：官方为大上下文 MoE，但托管/免费网关常更紧
-# 用字符预算做拆分（中文≈1.5–2 字/token，英文≈4 字符/token）取保守值
+# stepfun-ai/step-3.5-flash：Context Length ≈ 262K tokens
 DEFAULT_MODEL = "stepfun-ai/step-3.5-flash"
-DEFAULT_MAX_CHUNK_CHARS = 24000  # 单次送入模型的原文上限
-DEFAULT_MAX_PARTIAL_CHARS = 6000  # 分块摘要汇总时的单块摘要长度控制
+# 默认约 18 万汉字/次（仍留 system + 输出余量）；一般 1–3 小时字幕远不够拆
+DEFAULT_MAX_CHUNK_CHARS = 180_000
+DEFAULT_MAX_PARTIAL_CHARS = 12_000  # 若真分块，单段摘要上限（给综合轮用）
 
 
 def load_summarize_client(

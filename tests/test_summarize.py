@@ -28,6 +28,7 @@ def test_split_text_long_multiple():
     assert "段落A" in joined and "段落B" in joined
 
 
-def test_default_chunk_budget_reasonable():
-    # 保守预算，避免顶满 step-3.5-flash 网关
-    assert 8000 <= DEFAULT_MAX_CHUNK_CHARS <= 100000
+def test_default_chunk_budget_matches_long_context():
+    # step-3.5-flash 约 262K tokens，默认字符预算应远高于早期 24k 试探值
+    assert DEFAULT_MAX_CHUNK_CHARS >= 100_000
+    assert DEFAULT_MAX_CHUNK_CHARS <= 400_000
