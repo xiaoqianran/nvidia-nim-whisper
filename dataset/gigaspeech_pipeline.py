@@ -28,7 +28,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from dataset.cleanup import disk_free_gb, purge_hf_cache
+from dataset.cleanup import AsyncCacheCleaner, disk_free_gb
 from dataset.sink import JsonlSink
 from dataset.source_hf import iter_gigaspeech
 from dataset.state import SegmentState
@@ -238,25 +238,35 @@ def main(argv: list[str] | None = None) -> int:
     submitted = 0
     t0 = time.time()
 
+    def _on_cleanup_done(info: dict) -> None:
+        if args.quiet:
+            return
+        mb = info.get("removed_bytes", 0) / (1024 * 1024)
+        print(
+            f"  [cleanup-async] 清理完成 {mb:.1f} MB | "
+            f"free {info.get('free_gb_before', 0):.2f}→{info.get('free_gb_after', 0):.2f} GB",
+            flush=True,
+        )
+
+    # 后台清理，不阻塞 ASR/翻译调度
+    cleaner = AsyncCacheCleaner(
+        cache,
+        min_free_gb=args.min_free_gb,
+        max_cache_gb=args.max_cache_gb,
+        older_than_sec=60,
+        on_done=_on_cleanup_done if not args.quiet else None,
+    )
+
     def _maybe_cleanup(force: bool = False) -> None:
         if not force and args.cleanup_every <= 0:
             return
         if not force and args.cleanup_every > 0 and ok > 0 and ok % args.cleanup_every != 0:
             return
-        info = purge_hf_cache(
-            cache,
-            min_free_gb=args.min_free_gb,
-            max_cache_gb=args.max_cache_gb,
-            force=force or (args.cleanup_every > 0 and ok > 0 and ok % args.cleanup_every == 0),
-            older_than_sec=60,
+        started = cleaner.request(
+            force=force or (args.cleanup_every > 0 and ok > 0 and ok % args.cleanup_every == 0)
         )
-        if not args.quiet and info.get("purged"):
-            mb = info["removed_bytes"] / (1024 * 1024)
-            print(
-                f"  [cleanup] 清理缓存 {mb:.1f} MB | "
-                f"free {info['free_gb_before']:.2f}→{info['free_gb_after']:.2f} GB",
-                flush=True,
-            )
+        if started and not args.quiet:
+            print("  [cleanup-async] 后台清理已启动…", flush=True)
 
     def _handle_result(rec: dict[str, Any]) -> None:
         nonlocal ok, err
@@ -347,17 +357,14 @@ def main(argv: list[str] | None = None) -> int:
                 print("Key 统计:")
                 for row in pool.stats_summary():
                     print(f"  {row['key']}: {row['requests']} 次")
-            # 结束强制清缓存
+            # 结束时后台强制清缓存，最多等 30s（避免拖太久）
             try:
-                info = purge_hf_cache(
-                    cache,
-                    min_free_gb=0,
-                    max_cache_gb=0,
-                    force=True,
-                    older_than_sec=0,
-                )
+                cleaner.request(force=True)
+                cleaner.wait(timeout=30.0)
+                info = cleaner._last_info or {}
+                mb = info.get("removed_bytes", 0) / (1024 * 1024)
                 print(
-                    f"结束清理缓存: {info['removed_bytes']/(1024*1024):.1f} MB | "
+                    f"结束清理缓存: {mb:.1f} MB | "
                     f"磁盘剩余 {disk_free_gb(out_dir):.2f} GB"
                 )
             except Exception as ce:
@@ -365,7 +372,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"磁盘剩余: {disk_free_gb(out_dir):.2f} GB")
         else:
             try:
-                purge_hf_cache(cache, force=True, older_than_sec=0, min_free_gb=0, max_cache_gb=0)
+                cleaner.request(force=True)
+                cleaner.wait(timeout=15.0)
             except Exception:
                 pass
         try:
