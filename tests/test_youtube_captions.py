@@ -143,3 +143,33 @@ def test_segments_to_cues_estimated():
     assert len(cues) == 2
     assert cues[0].text == "Hello"
     assert cues[-1].end <= 10.0 + 1e-6
+
+
+def test_lang_detect_and_whisper_code():
+    from common.lang_detect import looks_chinese, needs_translate_to_zh, whisper_language_code
+
+    assert looks_chinese("这是一个中文标题 Kimi K3 测试")
+    assert not needs_translate_to_zh("这是中文简介内容足够长")
+    assert needs_translate_to_zh("Hello this is an English title about AI")
+    assert whisper_language_code(title="Kimi K3 编程能力实测", description="国产模型") == "zh-CN"
+    assert whisper_language_code(title="Me at the zoo", description="elephants") == "en-US"
+
+
+def test_safe_stem_short():
+    from youtube.captions import safe_stem
+
+    assert safe_stem("🚀很长的标题", "ajOdExVgJV0", short=True) == "ajOdExVgJV0"
+    assert "🚀" not in safe_stem("x", "a/b", short=True)
+
+
+def test_video_done_resume(tmp_path):
+    from youtube.channel import is_video_done, mark_video_done
+
+    vid = "abc123"
+    d = tmp_path / vid
+    d.mkdir()
+    assert not is_video_done(d, vid)
+    (d / f"{vid}.zh.txt").write_text("你好世界这是转写\n", encoding="utf-8")
+    assert is_video_done(d, vid)
+    mark_video_done(d, vid, mode="whisper", outputs={"zh_txt": str(d / f"{vid}.zh.txt")})
+    assert is_video_done(d, vid)

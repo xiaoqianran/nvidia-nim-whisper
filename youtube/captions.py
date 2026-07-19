@@ -329,10 +329,19 @@ def cues_to_srt(cues: list[Cue]) -> str:
     return "\n".join(lines)
 
 
-def safe_stem(title: str, video_id: str) -> str:
-    base = (title or video_id or "youtube").strip()
+def safe_stem(title: str, video_id: str, *, short: bool = True) -> str:
+    """
+    输出文件名前缀。
+    short=True（默认）：只用 video_id，路径短且稳定。
+    short=False：标题截断 + video_id（兼容旧行为）。
+    """
+    vid = (video_id or "youtube").strip() or "youtube"
+    if short:
+        # 仅保留安全字符
+        return re.sub(r"[^A-Za-z0-9_-]+", "_", vid)[:64] or "youtube"
+    base = (title or vid).strip()
     base = re.sub(r"[\\/:*?\"<>|]+", "_", base)
     base = re.sub(r"\s+", " ", base).strip()[:80]
     if not base:
-        base = video_id or "youtube"
-    return f"{base}_{video_id}" if video_id and video_id not in base else base
+        base = vid
+    return f"{base}_{vid}" if vid and vid not in base else base

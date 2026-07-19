@@ -42,6 +42,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--no-translate", action="store_true")
     p.add_argument("--translate-workers", type=int, default=4)
     p.add_argument("--whisper-workers", type=int, default=None)
+    p.add_argument("--resume", action="store_true", default=True, help="跳过已完成 video_id（默认开）")
+    p.add_argument("--no-resume", action="store_false", dest="resume")
     p.add_argument("--env-file", type=Path, default=None)
     p.add_argument("-q", "--quiet", action="store_true")
     return p.parse_args(argv)
@@ -119,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             translate_workers=args.translate_workers,
             whisper_workers=ww,
             fallback_audio=not args.no_audio_fallback,
+            resume=args.resume,
             quiet=args.quiet,
         )
     except Exception as e:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +13,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from common.lang_detect import looks_chinese, needs_translate_to_zh
 from common.translate_cues import translate_plain_text
 from youtube.pipeline import YoutubeProcessResult, process_youtube_url
 
@@ -37,7 +38,6 @@ def list_channel_videos(
     yt_dlp = _require_yt_dlp()
     url = channel_url.rstrip("/")
     if not url.endswith("/videos"):
-        # @handle → @handle/videos
         if "/@" in url or url.rstrip("/").count("/") <= 3:
             url = url + "/videos"
 
@@ -84,6 +84,48 @@ def fetch_video_meta(
     }
 
 
+def video_done_marker(video_dir: Path, video_id: str) -> Path:
+    return video_dir / f"{video_id}.done.json"
+
+
+def is_video_done(video_dir: Path, video_id: str) -> bool:
+    """断点：存在 done 标记，或已有非空 zh_txt。"""
+    marker = video_done_marker(video_dir, video_id)
+    if marker.is_file():
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            if data.get("status") == "ok":
+                return True
+        except Exception:
+            pass
+    zh = video_dir / f"{video_id}.zh.txt"
+    if zh.is_file() and zh.stat().st_size > 10:
+        return True
+    return False
+
+
+def mark_video_done(
+    video_dir: Path,
+    video_id: str,
+    *,
+    mode: str,
+    outputs: dict[str, str],
+    error: str | None = None,
+) -> None:
+    payload = {
+        "video_id": video_id,
+        "status": "ok" if not error else "error",
+        "mode": mode,
+        "outputs": outputs,
+        "error": error,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    video_done_marker(video_dir, video_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 @dataclass
 class ChannelVideoResult:
     index: int
@@ -97,6 +139,35 @@ class ChannelVideoResult:
     chosen_lang: str | None
     outputs: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    skipped: bool = False
+
+
+def _maybe_translate_field(text: str, translator: Any, label: str, _log) -> str:
+    if not text:
+        return ""
+    if not needs_translate_to_zh(text):
+        _log(f"{label}已是中文，跳过翻译")
+        return text
+    if translator is None:
+        return ""
+    _log(f"翻译{label}…")
+    try:
+        if len(text) < 2500:
+            return translate_plain_text(text, translator)
+        parts, buf, n = [], [], 0
+        for para in text.replace("\r", "").split("\n"):
+            if n + len(para) > 1800 and buf:
+                parts.append(translate_plain_text("\n".join(buf), translator))
+                buf, n = [para], len(para)
+            else:
+                buf.append(para)
+                n += len(para) + 1
+        if buf:
+            parts.append(translate_plain_text("\n".join(buf), translator))
+        return "\n".join(parts)
+    except Exception as ex:
+        _log(f"{label}翻译失败: {ex}")
+        return ""
 
 
 def process_channel(
@@ -111,6 +182,7 @@ def process_channel(
     translate_workers: int = 4,
     whisper_workers: int = 8,
     fallback_audio: bool = True,
+    resume: bool = True,
     quiet: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> list[ChannelVideoResult]:
@@ -125,6 +197,8 @@ def process_channel(
 
     listing = list_channel_videos(channel_url, limit=limit, cookies=cookies)
     _log(f"频道: {listing['channel']} | 最近 {len(listing['entries'])} 个视频")
+    if resume:
+        _log("断点续跑: 已成功 video_id 将跳过")
 
     results: list[ChannelVideoResult] = []
     for i, e in enumerate(listing["entries"], 1):
@@ -134,8 +208,43 @@ def process_channel(
             url = f"https://www.youtube.com/watch?v={vid}"
 
         _log(f"\n======== [{i}/{limit}] {vid} ========")
-        video_out = out_dir / f"{i:02d}_{vid}"
+        # 短目录名：仅 video_id
+        video_out = out_dir / vid
         video_out.mkdir(parents=True, exist_ok=True)
+
+        if resume and is_video_done(video_out, vid):
+            _log(f"跳过（已完成）: {vid}")
+            # 尽量从 done / 旧 md 恢复摘要
+            marker = video_done_marker(video_out, vid)
+            mode, outs, err = "skipped", {}, None
+            if marker.is_file():
+                try:
+                    d = json.loads(marker.read_text(encoding="utf-8"))
+                    mode = d.get("mode") or "skipped"
+                    outs = d.get("outputs") or {}
+                    err = d.get("error")
+                except Exception:
+                    pass
+            zh_txt = video_out / f"{vid}.zh.txt"
+            if zh_txt.is_file():
+                outs.setdefault("zh_txt", str(zh_txt))
+            results.append(
+                ChannelVideoResult(
+                    index=i,
+                    video_id=vid,
+                    url=url,
+                    title=e.get("title") or "",
+                    title_zh="",
+                    description="",
+                    description_zh="",
+                    transcript_mode=mode,
+                    chosen_lang=None,
+                    outputs=outs,
+                    error=err,
+                    skipped=True,
+                )
+            )
+            continue
 
         try:
             meta = fetch_video_meta(vid, cookies=cookies)
@@ -160,39 +269,13 @@ def process_channel(
         desc = meta["description"]
         url = meta["webpage_url"]
 
-        title_zh = ""
-        desc_zh = ""
-        if translator is not None:
-            if title:
-                _log("翻译标题…")
-                try:
-                    title_zh = translate_plain_text(title, translator)
-                except Exception as ex:
-                    _log(f"标题翻译失败: {ex}")
-            if desc:
-                _log(f"翻译简介（{len(desc)} 字）…")
-                try:
-                    if len(desc) < 2500:
-                        desc_zh = translate_plain_text(desc, translator)
-                    else:
-                        parts, buf, n = [], [], 0
-                        for para in desc.replace("\r", "").split("\n"):
-                            if n + len(para) > 1800 and buf:
-                                parts.append(translate_plain_text("\n".join(buf), translator))
-                                buf, n = [para], len(para)
-                            else:
-                                buf.append(para)
-                                n += len(para) + 1
-                        if buf:
-                            parts.append(translate_plain_text("\n".join(buf), translator))
-                        desc_zh = "\n".join(parts)
-                except Exception as ex:
-                    _log(f"简介翻译失败: {ex}")
+        title_zh = _maybe_translate_field(title, translator, "标题", _log)
+        desc_zh = _maybe_translate_field(desc, translator, "简介", _log)
 
-        # 字幕 / Whisper
         prefetched = {
             "id": meta["id"],
             "title": title,
+            "description": desc,
             "manual": meta["manual"],
             "auto": meta["auto"],
         }
@@ -211,15 +294,15 @@ def process_channel(
             prefetched_meta=prefetched,
         )
 
-        # 写单条完整 md
-        md_path = out_dir / f"{i:02d}_{vid}.md"
         outs = {k: str(v) for k, v in proc.outputs.items()}
+        md_path = out_dir / f"{vid}.md"
         md_path.write_text(
             f"# {i}. {title}\n\n"
             f"- URL: {url}\n"
             f"- video_id: {vid}\n"
             f"- transcript_mode: {proc.mode}\n"
             f"- chosen_lang: {proc.chosen_lang}\n"
+            f"- whisper_lang: auto\n"
             f"- error: {proc.error}\n\n"
             f"## 标题（原文）\n\n{title}\n\n"
             f"## 标题（简体中文）\n\n{title_zh}\n\n"
@@ -230,6 +313,11 @@ def process_channel(
             + "\n",
             encoding="utf-8",
         )
+
+        if not proc.error and (outs.get("zh_txt") or outs.get("en_txt")):
+            mark_video_done(video_out, vid, mode=proc.mode, outputs=outs)
+        elif proc.error:
+            mark_video_done(video_out, vid, mode=proc.mode or "none", outputs=outs, error=proc.error)
 
         results.append(
             ChannelVideoResult(
@@ -247,7 +335,6 @@ def process_channel(
             )
         )
 
-    # JSON + README 摘录
     json_path = out_dir / "latest.json"
     payload = [
         {
@@ -262,6 +349,7 @@ def process_channel(
             "chosen_lang": r.chosen_lang,
             "outputs": r.outputs,
             "error": r.error,
+            "skipped": r.skipped,
         }
         for r in results
     ]
@@ -275,21 +363,25 @@ def process_channel(
         f"# {listing['channel'] or channel_url} 最近 {limit} 个视频\n\n",
         f"更新时间: {datetime.now(timezone.utc).isoformat()}\n\n",
         f"频道: {channel_url}\n\n",
-        "> README 为摘要；完整简介与字幕见各条 `0x_*.md` 与子目录。\n\n---\n",
+        "> README 为摘要；完整简介与字幕见 `{video_id}/` 与 `{video_id}.md`。\n\n---\n",
     ]
     for r in results:
         lines.append(f"\n## {r.index}. {r.title_zh or r.title}\n\n")
         lines.append(f"- **链接**: {r.url}\n")
-        lines.append(f"- **模式**: `{r.transcript_mode}` / lang=`{r.chosen_lang}`\n")
+        lines.append(f"- **目录**: `{r.video_id}/`\n")
+        lines.append(f"- **模式**: `{r.transcript_mode}` / lang=`{r.chosen_lang}`")
+        if r.skipped:
+            lines.append("（跳过/续跑）")
+        lines.append("\n")
         lines.append(f"- **标题原文**: {r.title}\n")
         lines.append(f"- **标题简体**: {r.title_zh}\n")
         lines.append(f"- **简介原文（摘录）**: {clip(r.description)}\n")
         lines.append(f"- **简介简体（摘录）**: {clip(r.description_zh)}\n")
         if r.outputs.get("zh_txt"):
-            lines.append(f"- **字幕/转写简体 txt**: `{r.outputs['zh_txt']}`\n")
+            lines.append(f"- **简体 txt**: `{r.outputs['zh_txt']}`\n")
         if r.outputs.get("en_txt"):
-            lines.append(f"- **英文字幕/转写 txt**: `{r.outputs['en_txt']}`\n")
-        lines.append(f"- **详情**: [`{r.index:02d}_{r.video_id}.md`](./{r.index:02d}_{r.video_id}.md)\n")
+            lines.append(f"- **英文 txt**: `{r.outputs['en_txt']}`\n")
+        lines.append(f"- **详情**: [`{r.video_id}.md`](./{r.video_id}.md)\n")
         if r.error:
             lines.append(f"- **错误**: {r.error}\n")
         lines.append("\n---\n")

@@ -237,21 +237,28 @@ def process_audio_fallback(
     _log(f"Whisper 英文: {en_txt}")
 
     if translator is not None and plain.strip():
-        _log("Whisper 结果译成简体…")
+        from common.lang_detect import looks_chinese, needs_translate_to_zh
         from common.translate_cues import translate_cues
         from youtube.captions import Cue as YCue
 
-        zh_cues = translate_cues(
-            cues,
-            translator,
-            workers=translate_workers,
-            quiet=quiet,
-            cue_factory=lambda s, e, t: YCue(s, e, t),
-        )
+        # Whisper 已是中文则不再翻译，直接作为简体产物
+        if looks_chinese(plain, threshold=0.3) or not needs_translate_to_zh(plain[:500]):
+            _log("转写已是中文，跳过翻译")
+            zh_cues = cues
+            zh_plain = plain
+        else:
+            _log("Whisper 结果译成简体…")
+            zh_cues = translate_cues(
+                cues,
+                translator,
+                workers=translate_workers,
+                quiet=quiet,
+                cue_factory=lambda s, e, t: YCue(s, e, t),
+            )
+            zh_plain = strip_to_plain_text(cues_to_plain_text(zh_cues))
         zh_srt = out_dir / f"{stem}.zh.srt"
         zh_srt.write_text(cues_to_srt(zh_cues), encoding="utf-8")
         outputs["zh_srt"] = zh_srt
-        zh_plain = strip_to_plain_text(cues_to_plain_text(zh_cues))
         zh_txt = out_dir / f"{stem}.zh.txt"
         zh_txt.write_text(zh_plain if zh_plain.endswith("\n") else zh_plain + "\n", encoding="utf-8")
         outputs["zh_txt"] = zh_txt

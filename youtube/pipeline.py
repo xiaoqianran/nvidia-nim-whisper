@@ -78,8 +78,22 @@ def process_youtube_url(
 
     video_id = meta.get("id") or "unknown"
     title = meta.get("title") or video_id
-    stem = safe_stem(title, video_id)
+    # 默认短名：仅 video_id，避免 emoji/超长中文路径
+    stem = safe_stem(title, video_id, short=True)
     dump_lang_list_json(meta, out_dir / f"{stem}.langs.json")
+
+    # 自动语种（可被显式 language_code 覆盖：仅当调用方传入默认 en-US 时自动推断）
+    from common.lang_detect import whisper_language_code
+
+    desc_hint = (prefetched_meta or {}).get("description") or ""
+    auto_lang = whisper_language_code(title=title, description=str(desc_hint))
+    # 调用方若显式传了非默认，保留；默认 en-US 则改用自动
+    if language_code in ("en-US", "en", ""):
+        # 中文片用 zh-CN；英文片保持 en-US
+        effective_lang = auto_lang
+    else:
+        effective_lang = language_code
+    _log(f"Whisper 语种: {effective_lang}（title 启发）")
 
     mode, track = pick_caption_track(meta.get("manual") or [], meta.get("auto") or [])
 
@@ -209,7 +223,7 @@ def process_youtube_url(
             riva_client=riva_client,
             pool=asr_pool,
             translator=translator,
-            language_code=language_code,
+            language_code=effective_lang,
             translate_workers=translate_workers,
             whisper_workers=whisper_workers,
             quiet=quiet,
