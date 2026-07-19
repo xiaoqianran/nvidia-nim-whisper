@@ -44,7 +44,7 @@ uv venv && uv pip install -r requirements.txt
 # 单 Key
 export NVIDIA_API_KEY='nvapi-...'
 
-# 多 Key 负载均衡（推荐）：总配额 ≈ n × 40/min
+# 多 Key 负载均衡（推荐）：总配额 ≈ n × 50/min
 export NVIDIA_API_KEYS='nvapi-key1,nvapi-key2,nvapi-key3'
 # 或每行一个的文件
 export NVIDIA_API_KEYS_FILE=./nvidia_api_keys.txt
@@ -56,7 +56,7 @@ export NVIDIA_API_KEYS_FILE=./nvidia_api_keys.txt
 |------|------|
 | 每 Key 限速 | 默认 40 次 / 60s 滑动窗口 |
 | 池化调度 | 有余量的 Key 轮询使用；全满则等最早释放的 Key |
-| 有效吞吐 | `n_keys × 40 / min`（6 个 Key ≈ **240/min**） |
+| 有效吞吐 | `n_keys × 40 / min`（6 个 Key ≈ **300/min**） |
 | 并发 | 默认 `workers = min(48, max(8, n_keys×6))` |
 | 失败 | 疑似限流时换 Key 重试 |
 
@@ -86,19 +86,19 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 
 ### 4. 翻译（NVIDIA 多 Key 负载均衡）
 
-与 Whisper 相同思路：多把 `nvapi-`，**每把独立 40/min**，客户端轮询。
+与 Whisper 相同思路：多把 `nvapi-`，**每把独立 50/min**，客户端轮询。
 
 ```bash
 # nvidia_translate_api_keys.txt 每行一个 nvapi-...
 # OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
 # OPENAI_MODEL=mistralai/mistral-small-4-119b-2603
-# TRANSLATE_RATE_LIMIT=40   # 每 Key
+# TRANSLATE_RATE_LIMIT=50   # 每 Key
 
 ./transcribe.sh talk.mp3 --translate
 python translate_openai.py --text "Hello, Spring Boot"
 ```
 
-6 把翻译 Key → 理论 **≈ 240 次/分钟**。
+6 把翻译 Key → 理论 **≈ 300 次/分钟**。
 ## 使用
 
 ```bash
@@ -133,7 +133,7 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 4. 按 chunk 起始时间偏移合并文本 / JSON / SRT  
 
 ```bash
-# 默认：30s 分段 + 8 并行 + 40/min 限速
+# 默认：30s 分段 + 8 并行 + 50/min 限速
 ./transcribe.sh talk.mp3
 
 # 强制串行（便于对比）
@@ -157,14 +157,14 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `--chunk-seconds` | 每段时长（秒），`<=0` 关闭分段 |
 | `--overlap-seconds` | 相邻段重叠，减轻边界吞字 |
 | `--workers` | 并行线程数，默认 `8`；`1`=串行 |
-| `--rate-limit` | **Whisper ASR** 滑动窗口次数，默认 `40`；`0`=关闭（也可用 `WHISPER_RATE_LIMIT`） |
+| `--rate-limit` | **Whisper ASR** 滑动窗口次数，默认 `50`；`0`=关闭（也可用 `WHISPER_RATE_LIMIT`） |
 | `--rate-window-sec` | Whisper 限速窗口秒数，默认 `60`（`WHISPER_RATE_WINDOW_SEC`） |
 | `--keep-chunks` | 保留 `*_chunks/` 下分段 WAV |
 | `--translate` | 转写后翻译（需 OpenAI 兼容 Key） |
 | `--to` | 目标语言，默认 `zh-CN` |
 | `--openai-base-url` / `--openai-model` / `--openai-api-key` | 翻译端点 |
 | `--translate-workers` | 按片段并行翻译线程数，默认 4 |
-| `--translate-rate-limit` | 翻译 **每 Key** 滑动窗口次数，默认 **40**/min |
+| `--translate-rate-limit` | 翻译 **每 Key** 滑动窗口次数，默认 **50**/min |
 | `--translate-rate-window-sec` | 翻译限速窗口，默认 60s |
 
 > 串行分段通常不比「整段一次」更快；**并行 + 限速** 才能明显缩短墙钟时间（受 API 并发与配额约束）。

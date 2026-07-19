@@ -49,7 +49,7 @@ DEFAULT_SERVER = "grpc.nvcf.nvidia.com:443"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHUNK_SECONDS = 30.0
 # NVIDIA API Trial 常见限速：滑动窗口 40 次/分钟
-DEFAULT_RATE_LIMIT = 40
+DEFAULT_RATE_LIMIT = 50
 DEFAULT_RATE_WINDOW_SEC = 60.0
 DEFAULT_WORKERS = 8
 
@@ -649,7 +649,7 @@ class NvidiaApiKeyPool:
     """
     多 Key 负载均衡 + 每 Key 独立滑动窗口限速。
 
-    有效吞吐 ≈ n_keys × rate_limit / window（例如 6×40 = 240 次/分钟）。
+    有效吞吐 ≈ n_keys × rate_limit / window（例如 6×50 = 300 次/分钟）。
     调度：优先选有剩余配额的 Key（轮询）；全满则等待最先腾出名额的 Key。
     """
 
@@ -967,7 +967,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--api-keys",
         default=None,
-        help="多个 Key，逗号/换行分隔；用于负载均衡突破单 Key 40/min",
+        help="多个 Key，逗号/换行分隔；用于负载均衡突破单 Key 限速",
     )
     p.add_argument(
         "--api-keys-file",
@@ -1017,7 +1017,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--rate-limit",
         type=int,
         default=None,
-        help="Whisper ASR 滑动窗口最大请求数（默认 40/min；可用 WHISPER_RATE_LIMIT）。0=关闭",
+        help="Whisper ASR 每 Key 滑动窗口最大请求数（默认 50/min；可用 WHISPER_RATE_LIMIT）。0=关闭",
     )
     p.add_argument(
         "--rate-window-sec",
@@ -1073,7 +1073,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--translate-rate-limit",
         type=int,
         default=None,
-        help="翻译 API 滑动窗口限速（次），默认 120；0=关闭。可用 TRANSLATE_RATE_LIMIT",
+        help="翻译每 Key 滑动窗口限速（次），默认 50；0=关闭。可用 TRANSLATE_RATE_LIMIT",
     )
     p.add_argument(
         "--translate-rate-window-sec",
@@ -1100,7 +1100,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         load_dotenv([cwd / ".env", script_dir / ".env"])
 
-    # Whisper ASR 限速：CLI > 环境变量 > 默认 40/60s（按「每个 Key」计）
+    # Whisper ASR 限速：CLI > 环境变量 > 默认 50/60s（按「每个 Key」计）
     if args.rate_limit is None:
         args.rate_limit = int(
             os.environ.get("WHISPER_RATE_LIMIT")
