@@ -84,25 +84,28 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 
 ## 单文件分段
 
-默认将**单个**音视频按时间切成多段，再 **串行** 调 API（`--workers 1`）：
+默认将**单个**音视频按时间切成多段，再 **并行** 调 API（`--workers 8`），并遵守滑动窗口限速：
 
 1. `ffmpeg` 转为 16 kHz 单声道 PCM WAV  
 2. 按 `--chunk-seconds`（默认 30s）切 chunk，可选 `--overlap-seconds` 重叠  
-3. 逐段 gRPC `offline_recognize`（`workers>1` 时线程池并行）  
+3. 线程池并行 gRPC `offline_recognize`（客户端限速 **40 次 / 60s 滑动窗口**，对齐 NVIDIA Trial）  
 4. 按 chunk 起始时间偏移合并文本 / JSON / SRT  
 
 ```bash
-# 默认：30 秒一片，串行
+# 默认：30s 分段 + 8 并行 + 40/min 限速
 ./transcribe.sh talk.mp3
 
-# 60 秒一片，边界重叠 1 秒
-./transcribe.sh talk.mp3 --chunk-seconds 60 --overlap-seconds 1
+# 强制串行（便于对比）
+./transcribe.sh talk.mp3 --workers 1
+
+# 60 秒一片，边界重叠 1 秒，16 并行
+./transcribe.sh talk.mp3 --chunk-seconds 60 --overlap-seconds 1 --workers 16
 
 # 不切分（整段一次请求）
 ./transcribe.sh talk.mp3 --chunk-seconds 0
 
-# 并行 3 路请求（仍是单文件多 chunk）
-./transcribe.sh talk.mp3 --chunk-seconds 30 --workers 3
+# 关闭客户端限速（不推荐，易 429）
+./transcribe.sh talk.mp3 --rate-limit 0
 
 # 保留分段 WAV 便于调试
 ./transcribe.sh talk.mp3 --keep-chunks
@@ -112,8 +115,12 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 |------|------|
 | `--chunk-seconds` | 每段时长（秒），`<=0` 关闭分段 |
 | `--overlap-seconds` | 相邻段重叠，减轻边界吞字 |
-| `--workers` | `1` 串行（默认）；`>1` 并行请求 |
+| `--workers` | 并行线程数，默认 `8`；`1`=串行 |
+| `--rate-limit` | 滑动窗口最大请求数，默认 `40`；`0`=关闭 |
+| `--rate-window-sec` | 限速窗口秒数，默认 `60` |
 | `--keep-chunks` | 保留 `*_chunks/` 下分段 WAV |
+
+> 串行分段通常不比「整段一次」更快；**并行 + 限速** 才能明显缩短墙钟时间（受 API 并发与配额约束）。
 
 ## 许可与条款
 

@@ -2,8 +2,8 @@
 """
 使用 NVIDIA build.nvidia.com 托管的 OpenAI Whisper Large V3 转录音视频。
 
-单文件分段：将整段音频切成固定时长的 chunk，逐段（串行）调用 API，
-再按时间偏移合并文本 / JSON / SRT。
+单文件分段：将整段音频切成固定时长的 chunk，默认并行调用 API
+（滑动窗口限速 40 次/分钟），再按时间偏移合并文本 / JSON / SRT。
 
 依赖:
   - ffmpeg / ffprobe
@@ -25,14 +25,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,10 @@ DEFAULT_FUNCTION_ID = "b702f636-f60c-4a3d-a6f4-f3568c13bd7d"
 DEFAULT_SERVER = "grpc.nvcf.nvidia.com:443"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHUNK_SECONDS = 30.0
+# NVIDIA API Trial 常见限速：滑动窗口 40 次/分钟
+DEFAULT_RATE_LIMIT = 40
+DEFAULT_RATE_WINDOW_SEC = 60.0
+DEFAULT_WORKERS = 8
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".flv", ".ts", ".mpeg", ".mpg"}
 AUDIO_EXTS = {".wav", ".mp3", ".flac", ".m4a", ".ogg", ".opus", ".aac", ".wma"}
@@ -504,48 +509,38 @@ def default_out_stem(input_path: Path) -> str:
     return input_path.stem.replace(" ", "_")
 
 
-def transcribe_one_chunk(
-    riva_client,
-    asr,
-    chunk: AudioChunk,
-    language_code: str,
-    sample_rate: int,
-    word_offsets: bool,
-) -> tuple[AudioChunk, str, list[dict[str, Any]], float]:
-    """转录单个 chunk，返回 (chunk, text, segments_global, elapsed)."""
-    raw = chunk.path.read_bytes()
-    # Riva 的 LINEAR_PCM 期望原始 PCM；若传入完整 wav 容器，
-    # 部分实现可处理。为稳妥只送 data 部分：
-    pcm = _wav_to_pcm(chunk.path)
+class SlidingWindowRateLimiter:
+    """滑动窗口限速：window_sec 内最多 max_calls 次。"""
 
-    t0 = time.time()
-    resp = offline_transcribe(
-        riva_client,
-        asr,
-        pcm if pcm is not None else raw,
-        language_code=language_code,
-        sample_rate=sample_rate,
-        word_offsets=word_offsets,
-    )
-    elapsed = time.time() - t0
-    text, segs = parse_response(resp)
+    def __init__(self, max_calls: int, window_sec: float = 60.0) -> None:
+        self.max_calls = max_calls
+        self.window_sec = window_sec
+        self._times: deque[float] = deque()
+        self._lock = threading.Lock()
 
-    # 无词级时间：在 chunk 时间窗内估算
-    if segs and max_word_time(segs) <= 0:
-        segs = estimate_segment_times(segs, None, chunk.start_sec, chunk.end_sec)
-    else:
-        segs = shift_segments(segs, chunk.start_sec)
-        for s in segs:
-            s.setdefault("chunk_index", chunk.index)
-            s.setdefault("chunk_start", chunk.start_sec)
-            s.setdefault("chunk_end", chunk.end_sec)
-
-    for s in segs:
-        s["chunk_index"] = chunk.index
-        s["chunk_start"] = chunk.start_sec
-        s["chunk_end"] = chunk.end_sec
-
-    return chunk, text, segs, elapsed
+    def acquire(self, quiet: bool = True) -> float:
+        """阻塞直到拿到名额，返回等待秒数。"""
+        waited = 0.0
+        if self.max_calls <= 0:
+            return 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._times and now - self._times[0] >= self.window_sec:
+                    self._times.popleft()
+                if len(self._times) < self.max_calls:
+                    self._times.append(now)
+                    return waited
+                sleep_for = self.window_sec - (now - self._times[0]) + 0.02
+            if sleep_for > 0:
+                if not quiet:
+                    print(
+                        f"  限速等待 {sleep_for:.1f}s"
+                        f"（滑动窗口 {self.max_calls}/{self.window_sec:g}s）…",
+                        flush=True,
+                    )
+                time.sleep(sleep_for)
+                waited += sleep_for
 
 
 def _wav_to_pcm(wav_path: Path) -> bytes | None:
@@ -557,6 +552,82 @@ def _wav_to_pcm(wav_path: Path) -> bytes | None:
         return None
 
 
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "resource_exhausted",
+        "quota",
+        "429",
+        "throttl",
+    )
+    return any(n in msg for n in needles)
+
+
+def transcribe_one_chunk(
+    riva_client,
+    asr,
+    chunk: AudioChunk,
+    language_code: str,
+    sample_rate: int,
+    word_offsets: bool,
+    limiter: SlidingWindowRateLimiter | None = None,
+    quiet: bool = True,
+    max_retries: int = 5,
+) -> tuple[AudioChunk, str, list[dict[str, Any]], float]:
+    """转录单个 chunk，返回 (chunk, text, segments_global, elapsed)."""
+    raw = chunk.path.read_bytes()
+    pcm = _wav_to_pcm(chunk.path)
+    audio = pcm if pcm is not None else raw
+
+    t0 = time.time()
+    last_err: BaseException | None = None
+    for attempt in range(1, max_retries + 1):
+        if limiter is not None:
+            limiter.acquire(quiet=quiet)
+        try:
+            resp = offline_transcribe(
+                riva_client,
+                asr,
+                audio,
+                language_code=language_code,
+                sample_rate=sample_rate,
+                word_offsets=word_offsets,
+            )
+            break
+        except Exception as e:
+            last_err = e
+            if attempt >= max_retries or not _is_rate_limit_error(e):
+                raise
+            backoff = min(30.0, 1.5 * attempt + 0.5)
+            if not quiet:
+                print(
+                    f"  chunk#{chunk.index} 疑似限速，{backoff:.1f}s 后重试"
+                    f"（{attempt}/{max_retries}）: {e}",
+                    flush=True,
+                )
+            time.sleep(backoff)
+    else:
+        raise last_err or RuntimeError("转录失败")
+
+    elapsed = time.time() - t0
+    text, segs = parse_response(resp)
+
+    if segs and max_word_time(segs) <= 0:
+        segs = estimate_segment_times(segs, None, chunk.start_sec, chunk.end_sec)
+    else:
+        segs = shift_segments(segs, chunk.start_sec)
+
+    for s in segs:
+        s["chunk_index"] = chunk.index
+        s["chunk_start"] = chunk.start_sec
+        s["chunk_end"] = chunk.end_sec
+
+    return chunk, text, segs, elapsed
+
+
 def run_chunks(
     riva_client,
     asr,
@@ -566,19 +637,31 @@ def run_chunks(
     word_offsets: bool,
     workers: int,
     quiet: bool,
+    rate_limit: int = DEFAULT_RATE_LIMIT,
+    rate_window_sec: float = DEFAULT_RATE_WINDOW_SEC,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     """
     对 chunk 列表做识别。
 
-    workers=1: 严格串行（默认）
-    workers>1: 线程池并行请求（仍按 index 合并结果）
+    workers=1: 串行
+    workers>1: 线程池并行（受滑动窗口限速约束）
     """
     results: dict[int, tuple[str, list[dict[str, Any]], float]] = {}
     total = len(chunks)
+    limiter = (
+        SlidingWindowRateLimiter(rate_limit, rate_window_sec) if rate_limit > 0 else None
+    )
 
     def _work(ch: AudioChunk):
         return transcribe_one_chunk(
-            riva_client, asr, ch, language_code, sample_rate, word_offsets
+            riva_client,
+            asr,
+            ch,
+            language_code,
+            sample_rate,
+            word_offsets,
+            limiter=limiter,
+            quiet=quiet,
         )
 
     if workers <= 1:
@@ -599,7 +682,12 @@ def run_chunks(
                 print(f"    完成 {elapsed:.1f}s | {preview}", flush=True)
     else:
         if not quiet:
-            print(f"并行 workers={workers}，共 {total} 个 chunk …", flush=True)
+            rl = (
+                f"限速 {rate_limit}/{rate_window_sec:g}s 滑动窗口"
+                if rate_limit > 0
+                else "无限速"
+            )
+            print(f"并行 workers={workers}，共 {total} 个 chunk，{rl} …", flush=True)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(_work, ch): ch for ch in chunks}
             done = 0
@@ -701,8 +789,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--workers",
         type=int,
-        default=1,
-        help="并行请求线程数。1=串行（推荐）；>1 并行打 API",
+        default=DEFAULT_WORKERS,
+        help="并行请求线程数。1=串行；默认并行以缩短墙钟时间",
+    )
+    p.add_argument(
+        "--rate-limit",
+        type=int,
+        default=DEFAULT_RATE_LIMIT,
+        help="滑动窗口内最大请求数（NVIDIA Trial 约 40/min）。0=关闭客户端限速",
+    )
+    p.add_argument(
+        "--rate-window-sec",
+        type=float,
+        default=DEFAULT_RATE_WINDOW_SEC,
+        help="限速滑动窗口长度（秒）",
     )
     p.add_argument("--keep-wav", action="store_true", help="保留中间整段 WAV")
     p.add_argument("--keep-chunks", action="store_true", help="保留分段 WAV 文件")
@@ -776,11 +876,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.chunk_seconds <= 0:
                 print("分段: 关闭（整段一次请求）")
             else:
+                mode = "并行" if args.workers > 1 else "串行"
+                rl = (
+                    f"限速 {args.rate_limit}/{args.rate_window_sec:g}s"
+                    if args.rate_limit > 0
+                    else "无限速"
+                )
                 print(
                     f"分段: {len(chunks)} 片 × {args.chunk_seconds:g}s"
                     f"（重叠 {args.overlap_seconds:g}s）"
-                    f" | workers={args.workers}"
-                    f" | {'并行' if args.workers > 1 else '串行'}"
+                    f" | workers={args.workers} ({mode}) | {rl}"
                 )
 
         asr = build_asr_service(
@@ -803,6 +908,8 @@ def main(argv: list[str] | None = None) -> int:
             word_offsets=args.word_offsets,
             workers=args.workers,
             quiet=args.quiet,
+            rate_limit=args.rate_limit,
+            rate_window_sec=args.rate_window_sec,
         )
         elapsed = time.time() - t0
         if not args.quiet:
@@ -834,6 +941,8 @@ def main(argv: list[str] | None = None) -> int:
             "chunk_seconds": args.chunk_seconds,
             "overlap_seconds": args.overlap_seconds,
             "workers": args.workers,
+            "rate_limit": args.rate_limit,
+            "rate_window_sec": args.rate_window_sec,
             "chunks": chunk_meta,
             "timing_note": timing_note,
             "text": full_text,
