@@ -194,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
                 rate_limit=args.translate_rate_limit,
             )
         except ValueError as e:
-            print(f"错误: {e}", file=sys.stderr)
+            print(
+                f"错误: {e}\n"
+                "  请配置 NVIDIA_TRANSLATE_API_KEYS_FILE 或 nvidia_translate_api_keys.txt",
+                file=sys.stderr,
+            )
             return 1
 
     workers = max(1, min(args.workers, args.max_in_flight))
@@ -219,7 +223,10 @@ def main(argv: list[str] | None = None) -> int:
         if translator:
             print(
                 f"翻译: {translator.config.model} → {translator.config.target} "
-                f"| 限速 {translator.config.rate_limit}/{translator.config.rate_window_sec:g}s"
+                f"| base={translator.config.base_url} "
+                f"| {translator.pool.size} keys × {translator.config.rate_limit}/"
+                f"{translator.config.rate_window_sec:g}s "
+                f"≈ {translator.pool.effective_rpm()}/min"
             )
         else:
             print("翻译: 关闭")

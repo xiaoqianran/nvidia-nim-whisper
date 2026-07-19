@@ -33,8 +33,10 @@ if [[ -z "${NVIDIA_API_KEY:-}" && -z "${NVIDIA_API_KEYS:-}" && -z "${NVIDIA_API_
   export NVIDIA_API_KEYS_FILE="${NVIDIA_API_KEYS_FILE:-$ROOT/nvidia_api_keys.txt}"
 fi
 
-if [[ -z "${OPENAI_API_KEY:-}" && -z "${LLM_API_KEY:-}" ]]; then
-  echo "警告: 未设置 OPENAI_API_KEY，翻译可能失败。请检查 .env" >&2
+if [[ -z "${NVIDIA_TRANSLATE_API_KEYS_FILE:-}" && -z "${OPENAI_API_KEY:-}" && -z "${LLM_API_KEY:-}" ]]; then
+  if [[ ! -f "$ROOT/nvidia_translate_api_keys.txt" ]]; then
+    echo "警告: 未找到翻译 Key（nvidia_translate_api_keys.txt 或 NVIDIA_TRANSLATE_API_KEYS_FILE）" >&2
+  fi
 fi
 
 if [[ -x "$ROOT/.venv/bin/python" ]]; then

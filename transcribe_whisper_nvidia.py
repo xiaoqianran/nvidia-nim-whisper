@@ -1248,13 +1248,18 @@ def main(argv: list[str] | None = None) -> int:
                 rate_window_sec=args.translate_rate_window_sec,
             )
         except ValueError as e:
-            die(str(e) + "\n  翻译需设置 OPENAI_API_KEY（及可选 OPENAI_BASE_URL / OPENAI_MODEL）")
+            die(
+                str(e)
+                + "\n  翻译需 NVIDIA/OpenAI Key 池："
+                "NVIDIA_TRANSLATE_API_KEYS_FILE 或 nvidia_translate_api_keys.txt"
+            )
 
         if not args.quiet:
             rl = (
-                f"限速 {translator.config.rate_limit}/{translator.config.rate_window_sec:g}s"
+                f"{translator.pool.size} keys × {translator.config.rate_limit}/"
+                f"{translator.config.rate_window_sec:g}s ≈ {translator.pool.effective_rpm()}/min"
                 if translator.config.rate_limit > 0
-                else "无限速"
+                else f"{translator.pool.size} keys 无限速"
             )
             print(
                 f"正在翻译 → {translator.config.target} "
