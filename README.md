@@ -228,11 +228,13 @@ chmod +x run_youtube_channel.sh
 
 公共逻辑：`common/translate_cues.py`（cue 翻译）、`common/lang_detect.py`（中文启发/Whisper 语种）、`youtube/audio_whisper.py`（音频 Whisper）。
 
-频道 P0 行为：
+频道输出约定：
 
-- **短目录名**：`out/{video_id}/`，文件 `{video_id}.zh.txt` 等  
-- **断点续跑**：默认 `--resume`，已有 `zh.txt` 或 `.done.json` 则跳过  
-- **语种自动**：标题/简介偏中文 → Whisper `zh-CN`，已是中文则不再浪费翻译配额  
+- **README.md**：标题/简介原文与简体均为**全文**（不再单独写 `01_xxx.md` 简介文件）  
+- **latest.json**：机器可读全量  
+- **短目录名**（字幕/转写，可选）：`out/{video_id}/` → `{video_id}.zh.txt` 等  
+- **断点续跑**：默认 `--resume`  
+- **语种自动**：中文片 Whisper `zh-CN`；已是中文则跳过翻译  
 
 ## 数据集模块：GigaSpeech 增量流水线
 
