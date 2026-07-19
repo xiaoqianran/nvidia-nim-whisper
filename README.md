@@ -84,22 +84,21 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 
 优先级：`--api-key` > 已 export 的环境变量 > `.env`。
 
-### 4. 翻译（OpenAI 兼容）
+### 4. 翻译（NVIDIA 多 Key 负载均衡）
+
+与 Whisper 相同思路：多把 `nvapi-`，**每把独立 40/min**，客户端轮询。
 
 ```bash
-export OPENAI_API_KEY='sk-...'
-export OPENAI_BASE_URL='https://api.openai.com/v1'   # 任意兼容端点
-export OPENAI_MODEL='gpt-4o-mini'
+# nvidia_translate_api_keys.txt 每行一个 nvapi-...
+# OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
+# OPENAI_MODEL=meta/llama-3.1-8b-instruct
+# TRANSLATE_RATE_LIMIT=40   # 每 Key
 
 ./transcribe.sh talk.mp3 --translate
-./transcribe.sh talk.mp3 --translate --to zh-CN --translate-workers 4
-
-# 仅测翻译模块
 python translate_openai.py --text "Hello, Spring Boot"
-python translate_openai.py -i out_transcript.txt -o out_transcript.zh.txt
 ```
 
-任意兼容 `POST /v1/chat/completions` 的服务均可（OpenAI、Azure OpenAI、vLLM、OneAPI、NVIDIA integrate.api 等）。
+6 把翻译 Key → 理论 **≈ 240 次/分钟**。
 ## 使用
 
 ```bash
