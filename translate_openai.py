@@ -2,7 +2,7 @@
 """
 OpenAI 兼容 Chat Completions 翻译模块（支持 NVIDIA 多 Key 负载均衡）。
 
-默认对接 https://integrate.api.nvidia.com/v1 ，每把 nvapi Key 独立 50/min 滑动窗口，
+默认对接 https://integrate.api.nvidia.com/v1 ，每把 nvapi Key 独立 60/min 滑动窗口，
 请求在 Key 池内轮询调度（与 Whisper ASR 池同思路）。
 
 环境变量:
@@ -11,7 +11,7 @@ OpenAI 兼容 Chat Completions 翻译模块（支持 NVIDIA 多 Key 负载均衡
   OPENAI_BASE_URL   默认 https://integrate.api.nvidia.com/v1
   OPENAI_MODEL      默认 mistralai/mistral-small-4-119b-2603
   TRANSLATE_TO      默认 zh-CN
-  TRANSLATE_RATE_LIMIT         每 Key 限速，默认 50
+  TRANSLATE_RATE_LIMIT         每 Key 限速，默认 60
   TRANSLATE_RATE_WINDOW_SEC    默认 60
 
 用法:
@@ -45,8 +45,8 @@ DEFAULT_TARGET = "zh-CN"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_TIMEOUT = 120
-# 每把 NVIDIA Key 独立限速（实测 40 偏保守，默认 50）
-DEFAULT_RATE_LIMIT = 50
+# 每把 NVIDIA Key 独立限速（实测 40 偏保守，默认 60）
+DEFAULT_RATE_LIMIT = 60
 DEFAULT_RATE_WINDOW_SEC = 60.0
 
 

@@ -44,7 +44,7 @@ uv venv && uv pip install -r requirements.txt
 # 单 Key
 export NVIDIA_API_KEY='nvapi-...'
 
-# 多 Key 负载均衡（推荐）：总配额 ≈ n × 50/min
+# 多 Key 负载均衡（推荐）：总配额 ≈ n × 60/min
 export NVIDIA_API_KEYS='nvapi-key1,nvapi-key2,nvapi-key3'
 # 或每行一个的文件
 export NVIDIA_API_KEYS_FILE=./nvidia_api_keys.txt
@@ -86,7 +86,7 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 
 ### 4. 翻译（NVIDIA 多 Key 负载均衡）
 
-与 Whisper 相同思路：多把 `nvapi-`，**每把独立 50/min**，客户端轮询。
+与 Whisper 相同思路：多把 `nvapi-`，**每把独立 60/min**，客户端轮询。
 
 ```bash
 # nvidia_translate_api_keys.txt 每行一个 nvapi-...
@@ -98,7 +98,7 @@ python transcribe_whisper_nvidia.py media.mp4 --api-key 'nvapi-...'
 python translate_openai.py --text "Hello, Spring Boot"
 ```
 
-6 把翻译 Key → 理论 **≈ 300 次/分钟**。
+6 把翻译 Key → 理论 **≈ 360 次/分钟**。
 ## 使用
 
 ```bash
@@ -133,7 +133,7 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 4. 按 chunk 起始时间偏移合并文本 / JSON / SRT  
 
 ```bash
-# 默认：30s 分段 + 8 并行 + 50/min 限速
+# 默认：30s 分段 + 8 并行 + 60/min 限速
 ./transcribe.sh talk.mp3
 
 # 强制串行（便于对比）
