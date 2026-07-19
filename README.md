@@ -178,10 +178,65 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `*_transcript.zh.txt` / `*.zh.srt` | 译文 |
 | `*_transcript.json` | 含 `text`、`text_zh`、`segments[].text_zh` |
 
+## 数据集模块：GigaSpeech 增量流水线
+
+面向 [speechcolab/gigaspeech](https://huggingface.co/datasets/speechcolab/gigaspeech)，**不整库下载**：
+
+```text
+HF streaming → 内存 PCM → Whisper(Key 池) →（可选）中文翻译 → JSONL
+音频处理完即丢弃；磁盘 mainly 只有结果 + 进度库
+```
+
+与本地媒体模块的区别：
+
+| | `transcribe_whisper_nvidia.py` | `dataset.gigaspeech_pipeline` |
+|--|--------------------------------|-------------------------------|
+| 输入 | 本地音视频文件 | HuggingFace streaming |
+| 切分 | 默认 30s | **官方 segment**，默认不再切 |
+| 输出 | 每文件 txt/srt | 流式 **JSONL** + SQLite 断点 |
+
+### 安装额外依赖
+
+```bash
+pip install -r requirements.txt   # 含 datasets / numpy
+huggingface-cli login             # 或 export HF_TOKEN=hf_...
+# 在 HF 网页同意 GigaSpeech 使用条款
+```
+
+### 运行
+
+```bash
+# 试跑 50 条 xs + 译中
+python -m dataset.gigaspeech_pipeline \
+  --subset xs --max-samples 50 --translate \
+  --out-dir ./out/gigaspeech_xs \
+  --hf-cache-dir ./out/.hf_cache
+
+# 断点续跑（默认 --resume）
+python -m dataset.gigaspeech_pipeline --subset xs --out-dir ./out/gigaspeech_xs --translate
+
+# 跳过 ASR，只用官方英文 ref 译中（省 NVIDIA 配额）
+python -m dataset.gigaspeech_pipeline --subset xs --skip-whisper-use-ref --translate --max-samples 100
+```
+
+产物：
+
+- `out/.../gigaspeech_{subset}_{split}.jsonl` — 每行一条 segment  
+- `out/.../gigaspeech_{subset}_{split}.state.sqlite` — 已完成 id（resume）
+
+JSONL 字段含：`segment_id`, `ref_text`, `whisper_text`, `text_zh`, `duration_sec`, `asr_key`, `error` 等。
+
+省磁盘建议：
+
+- 始终 `streaming`（默认）
+- `--hf-cache-dir` 指到可清理的小目录 / tmp
+- 不要用非 streaming 的 `load_dataset` 全量下载
+
 ## 许可与条款
 
 - 本仓库脚本代码：MIT（见下方）  
 - 调用 NVIDIA 托管 API 须遵守 [NVIDIA API Trial Terms](https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf) 及 build.nvidia.com 相关条款  
+- GigaSpeech 须遵守 SpeechColab / HuggingFace 数据集条款  
 
 ## License
 

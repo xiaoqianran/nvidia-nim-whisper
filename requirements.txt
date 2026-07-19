@@ -1,2 +1,7 @@
 # NVIDIA Whisper Large V3 (build.nvidia.com NIM) 客户端
 nvidia-riva-client>=2.26.0
+
+# GigaSpeech 增量数据集模块（streaming）
+datasets>=2.16.0
+huggingface_hub>=0.20.0
+numpy>=1.24.0

@@ -31,6 +31,12 @@ __pycache__/
 *_transcript.json
 *.srt
 
+# 数据集流水线输出 / HF 本地缓存
+out/
+.hf_cache/
+*.state.sqlite
+*.jsonl
+
 # 系统与编辑器
 .DS_Store
 .idea/
