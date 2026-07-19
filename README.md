@@ -143,6 +143,8 @@ python transcribe_whisper_nvidia.py video.mp4 --keep-wav --stem my_talk
 | `--to` | 目标语言，默认 `zh-CN` |
 | `--openai-base-url` / `--openai-model` / `--openai-api-key` | 翻译端点 |
 | `--translate-workers` | 按片段并行翻译线程数，默认 4 |
+| `--translate-rate-limit` | 翻译 API 滑动窗口次数，默认 **40**/min |
+| `--translate-rate-window-sec` | 翻译限速窗口，默认 60s |
 
 > 串行分段通常不比「整段一次」更快；**并行 + 限速** 才能明显缩短墙钟时间（受 API 并发与配额约束）。
 

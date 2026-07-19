@@ -852,6 +852,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="按字幕片段并行翻译的线程数",
     )
     p.add_argument(
+        "--translate-rate-limit",
+        type=int,
+        default=None,
+        help="翻译 API 滑动窗口限速（次），默认 40；0=关闭。可用 TRANSLATE_RATE_LIMIT",
+    )
+    p.add_argument(
+        "--translate-rate-window-sec",
+        type=float,
+        default=None,
+        help="翻译限速窗口秒数，默认 60",
+    )
+    p.add_argument(
         "--translate-only-zh-outputs",
         action="store_true",
         help="开启翻译时，SRT/TXT 默认只写中文文件（仍保留原文 txt/json 中的 text 字段）",
@@ -982,15 +994,23 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.openai_base_url,
                 model=args.openai_model,
                 target=args.translate_to,
+                rate_limit=args.translate_rate_limit,
+                rate_window_sec=args.translate_rate_window_sec,
             )
         except ValueError as e:
             die(str(e) + "\n  翻译需设置 OPENAI_API_KEY（及可选 OPENAI_BASE_URL / OPENAI_MODEL）")
 
         if not args.quiet:
+            rl = (
+                f"限速 {translator.config.rate_limit}/{translator.config.rate_window_sec:g}s"
+                if translator.config.rate_limit > 0
+                else "无限速"
+            )
             print(
                 f"正在翻译 → {translator.config.target} "
                 f"| model={translator.config.model} "
-                f"| base={translator.config.base_url}",
+                f"| base={translator.config.base_url} "
+                f"| {rl}",
                 flush=True,
             )
         t1 = time.time()
@@ -1009,6 +1029,8 @@ def main(argv: list[str] | None = None) -> int:
             "model": translator.config.model,
             "base_url": translator.config.base_url,
             "workers": args.translate_workers,
+            "rate_limit": translator.config.rate_limit,
+            "rate_window_sec": translator.config.rate_window_sec,
             "elapsed_sec": round(time.time() - t1, 3),
         }
         if not args.quiet:

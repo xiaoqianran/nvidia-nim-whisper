@@ -27,9 +27,11 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,11 +44,47 @@ DEFAULT_TARGET = "zh-CN"
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_RETRIES = 4
 DEFAULT_TIMEOUT = 120
+# 与常见 Trial / 网关一致：滑动窗口 40 次/分钟
+DEFAULT_RATE_LIMIT = 40
+DEFAULT_RATE_WINDOW_SEC = 60.0
 
 
 def _die(msg: str, code: int = 1) -> None:
     print(f"错误: {msg}", file=sys.stderr)
     raise SystemExit(code)
+
+
+class SlidingWindowRateLimiter:
+    """滑动窗口限速：window_sec 内最多 max_calls 次。"""
+
+    def __init__(self, max_calls: int, window_sec: float = 60.0) -> None:
+        self.max_calls = max_calls
+        self.window_sec = window_sec
+        self._times: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, quiet: bool = True) -> float:
+        waited = 0.0
+        if self.max_calls <= 0:
+            return 0.0
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._times and now - self._times[0] >= self.window_sec:
+                    self._times.popleft()
+                if len(self._times) < self.max_calls:
+                    self._times.append(now)
+                    return waited
+                sleep_for = self.window_sec - (now - self._times[0]) + 0.02
+            if sleep_for > 0:
+                if not quiet:
+                    print(
+                        f"  翻译限速等待 {sleep_for:.1f}s"
+                        f"（{self.max_calls}/{self.window_sec:g}s 滑动窗口）…",
+                        flush=True,
+                    )
+                time.sleep(sleep_for)
+                waited += sleep_for
 
 
 @dataclass
@@ -58,6 +96,8 @@ class TranslateConfig:
     temperature: float = DEFAULT_TEMPERATURE
     timeout: float = DEFAULT_TIMEOUT
     max_retries: int = DEFAULT_MAX_RETRIES
+    rate_limit: int = DEFAULT_RATE_LIMIT
+    rate_window_sec: float = DEFAULT_RATE_WINDOW_SEC
 
 
 class OpenAICompatTranslator:
@@ -72,6 +112,12 @@ class OpenAICompatTranslator:
             self.endpoint = base
         else:
             self.endpoint = f"{base}/chat/completions"
+        self._limiter = (
+            SlidingWindowRateLimiter(config.rate_limit, config.rate_window_sec)
+            if config.rate_limit > 0
+            else None
+        )
+        self._quiet_rate = True
 
     @classmethod
     def from_env(
@@ -81,6 +127,8 @@ class OpenAICompatTranslator:
         model: str | None = None,
         target: str | None = None,
         temperature: float | None = None,
+        rate_limit: int | None = None,
+        rate_window_sec: float | None = None,
     ) -> "OpenAICompatTranslator":
         key = (
             api_key
@@ -89,6 +137,12 @@ class OpenAICompatTranslator:
             or os.environ.get("TRANSLATE_API_KEY")
             or ""
         )
+        rl = rate_limit
+        if rl is None:
+            rl = int(os.environ.get("TRANSLATE_RATE_LIMIT", DEFAULT_RATE_LIMIT))
+        rw = rate_window_sec
+        if rw is None:
+            rw = float(os.environ.get("TRANSLATE_RATE_WINDOW_SEC", DEFAULT_RATE_WINDOW_SEC))
         return cls(
             TranslateConfig(
                 api_key=key,
@@ -105,6 +159,8 @@ class OpenAICompatTranslator:
                     if temperature is not None
                     else float(os.environ.get("TRANSLATE_TEMPERATURE", DEFAULT_TEMPERATURE))
                 ),
+                rate_limit=rl,
+                rate_window_sec=rw,
             )
         )
 
@@ -126,7 +182,7 @@ class OpenAICompatTranslator:
             "4. 若输入已是目标语言，可轻微润色后原样返回"
         )
 
-    def translate(self, text: str) -> str:
+    def translate(self, text: str, *, quiet: bool | None = None) -> str:
         text = (text or "").strip()
         if not text:
             return ""
@@ -147,9 +203,12 @@ class OpenAICompatTranslator:
             # 部分网关/CDN（如 Cloudflare）会拦截默认 Python-urllib UA
             "User-Agent": "nvidia-nim-whisper/1.0 (+openai-compat-translate)",
         }
+        q = self._quiet_rate if quiet is None else quiet
 
         last_err: BaseException | None = None
         for attempt in range(1, self.config.max_retries + 1):
+            if self._limiter is not None:
+                self._limiter.acquire(quiet=q)
             req = urllib.request.Request(
                 self.endpoint,
                 data=data,
@@ -173,7 +232,7 @@ class OpenAICompatTranslator:
                 last_err = RuntimeError(f"HTTP {e.code}: {err_body[:500]}")
                 # 429/5xx 重试
                 if e.code in (429, 500, 502, 503, 504) and attempt < self.config.max_retries:
-                    time.sleep(min(20.0, 1.2 * attempt))
+                    time.sleep(min(20.0, 1.5 * attempt + 0.5))
                     continue
                 raise last_err from e
             except Exception as e:
@@ -197,18 +256,20 @@ class OpenAICompatTranslator:
         """
         按片段翻译，写入 out_key，保留时间轴字段。
         workers=1 串行；>1 并行（按 index 回填）。
+        受 rate_limit 滑动窗口约束（默认 40/min）。
         """
         total = len(segments)
         if total == 0:
             return segments
 
+        self._quiet_rate = quiet
         results: dict[int, str] = {}
 
         def _one(i: int, seg: dict[str, Any]) -> tuple[int, str]:
             src = (seg.get(text_key) or "").strip()
             if not src:
                 return i, ""
-            return i, self.translate(src)
+            return i, self.translate(src, quiet=quiet)
 
         if workers <= 1:
             for i, seg in enumerate(segments):
@@ -221,7 +282,15 @@ class OpenAICompatTranslator:
                     print(f"  翻译 [{i + 1}/{total}] {preview}", flush=True)
         else:
             if not quiet:
-                print(f"  翻译并行 workers={workers}，共 {total} 段 …", flush=True)
+                rl = (
+                    f"限速 {self.config.rate_limit}/{self.config.rate_window_sec:g}s"
+                    if self.config.rate_limit > 0
+                    else "无限速"
+                )
+                print(
+                    f"  翻译并行 workers={workers}，共 {total} 段，{rl} …",
+                    flush=True,
+                )
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {ex.submit(_one, i, seg): i for i, seg in enumerate(segments)}
                 done = 0
@@ -253,7 +322,11 @@ class OpenAICompatTranslator:
     ) -> tuple[str, list[dict[str, Any]]]:
         """翻译片段并拼出全文。"""
         segs = self.translate_segments(
-            segments, text_key=text_key, out_key=out_key, workers=workers, quiet=quiet
+            segments,
+            text_key=text_key,
+            out_key=out_key,
+            workers=workers,
+            quiet=quiet,
         )
         parts = [(s.get(out_key) or "").strip() for s in segs]
         full = " ".join(p for p in parts if p)
@@ -273,6 +346,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--openai-model", default=None, help="覆盖 OPENAI_MODEL")
     p.add_argument("--to", dest="target", default=None, help="目标语言，默认 zh-CN")
     p.add_argument("--temperature", type=float, default=None)
+    p.add_argument(
+        "--rate-limit",
+        type=int,
+        default=None,
+        help=f"滑动窗口最大请求数，默认 {DEFAULT_RATE_LIMIT}；0=关闭",
+    )
+    p.add_argument(
+        "--rate-window-sec",
+        type=float,
+        default=None,
+        help=f"限速窗口秒数，默认 {DEFAULT_RATE_WINDOW_SEC:g}",
+    )
     return p.parse_args(argv)
 
 
@@ -288,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
             model=args.openai_model,
             target=args.target,
             temperature=args.temperature,
+            rate_limit=args.rate_limit,
+            rate_window_sec=args.rate_window_sec,
         )
     except ValueError as e:
         _die(str(e))
