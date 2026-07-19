@@ -1,0 +1,2 @@
+# NVIDIA Whisper Large V3 (build.nvidia.com NIM) 客户端
+nvidia-riva-client>=2.26.0
