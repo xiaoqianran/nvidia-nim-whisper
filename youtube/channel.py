@@ -295,24 +295,8 @@ def process_channel(
         )
 
         outs = {k: str(v) for k, v in proc.outputs.items()}
-        md_path = out_dir / f"{vid}.md"
-        md_path.write_text(
-            f"# {i}. {title}\n\n"
-            f"- URL: {url}\n"
-            f"- video_id: {vid}\n"
-            f"- transcript_mode: {proc.mode}\n"
-            f"- chosen_lang: {proc.chosen_lang}\n"
-            f"- whisper_lang: auto\n"
-            f"- error: {proc.error}\n\n"
-            f"## 标题（原文）\n\n{title}\n\n"
-            f"## 标题（简体中文）\n\n{title_zh}\n\n"
-            f"## 简介（原文）\n\n{desc}\n\n"
-            f"## 简介（简体中文）\n\n{desc_zh}\n\n"
-            f"## 转写产物\n\n"
-            + "\n".join(f"- {k}: `{p}`" for k, p in outs.items())
-            + "\n",
-            encoding="utf-8",
-        )
+
+        # 不再写单独的「简介 md」；全部汇总进 README 全文
 
         if not proc.error and (outs.get("zh_txt") or outs.get("en_txt")):
             mark_video_done(video_out, vid, mode=proc.mode, outputs=outs)
@@ -335,6 +319,13 @@ def process_channel(
             )
         )
 
+    write_channel_readme(
+        out_dir,
+        channel_name=listing["channel"] or channel_url,
+        channel_url=channel_url,
+        limit=limit,
+        results=results,
+    )
     json_path = out_dir / "latest.json"
     payload = [
         {
@@ -354,38 +345,48 @@ def process_channel(
         for r in results
     ]
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _log(f"\n完成。README（全文）: {out_dir / 'README.md'}")
+    return results
 
-    def clip(s: str, n: int = 200) -> str:
-        s = (s or "").replace("\n", " ").strip()
-        return s if len(s) <= n else s[:n] + "…"
 
+def write_channel_readme(
+    out_dir: Path,
+    *,
+    channel_name: str,
+    channel_url: str,
+    limit: int,
+    results: list[ChannelVideoResult],
+) -> Path:
+    """
+    单一 README：标题/简介原文与简体均为**全文**，不再另写每条简介 md。
+    （字幕/转写产物若有，只列路径，不在此展开。）
+    """
     lines = [
-        f"# {listing['channel'] or channel_url} 最近 {limit} 个视频\n\n",
+        f"# {channel_name} 最近 {limit} 个视频\n\n",
         f"更新时间: {datetime.now(timezone.utc).isoformat()}\n\n",
         f"频道: {channel_url}\n\n",
-        "> README 为摘要；完整简介与字幕见 `{video_id}/` 与 `{video_id}.md`。\n\n---\n",
+        "> 标题与简介均为**完整全文**（不再单独生成简介 md）。\n\n",
+        "---\n",
     ]
     for r in results:
         lines.append(f"\n## {r.index}. {r.title_zh or r.title}\n\n")
         lines.append(f"- **链接**: {r.url}\n")
-        lines.append(f"- **目录**: `{r.video_id}/`\n")
-        lines.append(f"- **模式**: `{r.transcript_mode}` / lang=`{r.chosen_lang}`")
-        if r.skipped:
-            lines.append("（跳过/续跑）")
-        lines.append("\n")
-        lines.append(f"- **标题原文**: {r.title}\n")
-        lines.append(f"- **标题简体**: {r.title_zh}\n")
-        lines.append(f"- **简介原文（摘录）**: {clip(r.description)}\n")
-        lines.append(f"- **简介简体（摘录）**: {clip(r.description_zh)}\n")
-        if r.outputs.get("zh_txt"):
-            lines.append(f"- **简体 txt**: `{r.outputs['zh_txt']}`\n")
-        if r.outputs.get("en_txt"):
-            lines.append(f"- **英文 txt**: `{r.outputs['en_txt']}`\n")
-        lines.append(f"- **详情**: [`{r.video_id}.md`](./{r.video_id}.md)\n")
+        lines.append(f"- **video_id**: `{r.video_id}`\n")
+        if r.transcript_mode:
+            lines.append(f"- **转写模式**: `{r.transcript_mode}`")
+            if r.chosen_lang:
+                lines.append(f" / `{r.chosen_lang}`")
+            if r.skipped:
+                lines.append("（跳过/续跑）")
+            lines.append("\n")
         if r.error:
             lines.append(f"- **错误**: {r.error}\n")
-        lines.append("\n---\n")
+        lines.append(f"\n### 标题（原文）\n\n{r.title or ''}\n\n")
+        lines.append(f"### 标题（简体中文）\n\n{r.title_zh or ''}\n\n")
+        lines.append(f"### 简介（原文）\n\n{r.description or ''}\n\n")
+        lines.append(f"### 简介（简体中文）\n\n{r.description_zh or ''}\n\n")
+        lines.append("---\n")
 
-    (out_dir / "README.md").write_text("".join(lines), encoding="utf-8")
-    _log(f"\n完成。索引: {out_dir / 'README.md'}")
-    return results
+    path = Path(out_dir) / "README.md"
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
