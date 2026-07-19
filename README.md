@@ -230,11 +230,26 @@ chmod +x run_youtube_channel.sh
 
 频道输出约定：
 
-- **README.md**：标题/简介原文与简体均为**全文**（不再单独写 `01_xxx.md` 简介文件）  
+- **README.md**：标题/简介原文与简体均为**全文**（不再单独写简介 md）  
 - **latest.json**：机器可读全量  
-- **短目录名**（字幕/转写，可选）：`out/{video_id}/` → `{video_id}.zh.txt` 等  
+- **短目录名**（字幕/转写）：`out/{video_id}/` → `{video_id}.zh.txt` 等  
+- **仅给总结用中文**：`./run_youtube_channel.sh ... --zh-only`（不写英文 en.*）  
 - **断点续跑**：默认 `--resume`  
 - **语种自动**：中文片 Whisper `zh-CN`；已是中文则跳过翻译  
+
+### 总结子模块（公共 + YouTube）
+
+公共：`common/summarize.py` + `common/llm_chat.py`  
+- 模型默认 **`stepfun-ai/step-3.5-flash`**  
+- Key 池：`nvidia_summarize_api_keys.txt`，**每 Key 40/min**  
+- 超长文稿自动分块 map-reduce（默认每块 ≤24000 字符）
+
+```bash
+# 对已有中文台词/字幕做总结
+./run_youtube_summarize.sh path/to/xxx.zh.txt -o path/to/xxx.summary.md
+# 或目录
+./run_youtube_summarize.sh out/channel_xxx/VIDEO_ID --video-id VIDEO_ID
+```
 
 ## 数据集模块：GigaSpeech 增量流水线
 

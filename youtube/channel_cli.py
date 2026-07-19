@@ -44,6 +44,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--whisper-workers", type=int, default=None)
     p.add_argument("--resume", action="store_true", default=True, help="跳过已完成 video_id（默认开）")
     p.add_argument("--no-resume", action="store_false", dest="resume")
+    p.add_argument(
+        "--zh-only",
+        action="store_true",
+        help="仅保留中文文稿/字幕（给总结用，不写英文 en.txt/srt）",
+    )
     p.add_argument("--env-file", type=Path, default=None)
     p.add_argument("-q", "--quiet", action="store_true")
     return p.parse_args(argv)
@@ -123,6 +128,7 @@ def main(argv: list[str] | None = None) -> int:
             fallback_audio=not args.no_audio_fallback,
             resume=args.resume,
             quiet=args.quiet,
+            output_profile="zh_only" if args.zh_only else "full",
         )
     except Exception as e:
         print(f"错误: {type(e).__name__}: {e}", file=sys.stderr)

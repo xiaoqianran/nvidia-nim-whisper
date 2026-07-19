@@ -185,6 +185,7 @@ def process_channel(
     resume: bool = True,
     quiet: bool = False,
     log: Callable[[str], None] | None = None,
+    output_profile: str = "full",
 ) -> list[ChannelVideoResult]:
     def _log(msg: str) -> None:
         if log:
@@ -292,6 +293,7 @@ def process_channel(
             quiet=quiet,
             log=_log,
             prefetched_meta=prefetched,
+            output_profile=output_profile,
         )
 
         outs = {k: str(v) for k, v in proc.outputs.items()}

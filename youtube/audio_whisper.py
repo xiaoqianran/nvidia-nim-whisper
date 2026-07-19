@@ -184,6 +184,7 @@ def process_audio_fallback(
     quiet: bool = False,
     log: Callable[[str], None] | None = None,
     keep_audio: bool = False,
+    output_profile: str = "full",
 ) -> dict[str, Path]:
     """
     下载音频 → Whisper → 英文 txt/srt → 译中 zh txt/srt。
@@ -226,15 +227,17 @@ def process_audio_fallback(
 
     plain = strip_to_plain_text(cues_to_plain_text(cues) if cues else (text or ""))
     outputs: dict[str, Path] = {}
+    zh_only = output_profile == "zh_only"
 
-    en_txt = out_dir / f"{stem}.en.txt"
-    en_txt.write_text(plain if plain.endswith("\n") else plain + "\n", encoding="utf-8")
-    outputs["en_txt"] = en_txt
-    en_srt = out_dir / f"{stem}.en.srt"
-    en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
-    outputs["en_srt"] = en_srt
+    if not zh_only:
+        en_txt = out_dir / f"{stem}.en.txt"
+        en_txt.write_text(plain if plain.endswith("\n") else plain + "\n", encoding="utf-8")
+        outputs["en_txt"] = en_txt
+        en_srt = out_dir / f"{stem}.en.srt"
+        en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+        outputs["en_srt"] = en_srt
+        _log(f"Whisper 原文: {en_txt}")
     outputs["source"] = Path("whisper_audio")
-    _log(f"Whisper 英文: {en_txt}")
 
     if translator is not None and plain.strip():
         from common.lang_detect import looks_chinese, needs_translate_to_zh

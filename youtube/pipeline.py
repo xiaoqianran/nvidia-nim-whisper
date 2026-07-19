@@ -52,12 +52,17 @@ def process_youtube_url(
     quiet: bool = False,
     log: Callable[[str], None] | None = None,
     prefetched_meta: dict[str, Any] | None = None,
+    output_profile: str = "full",
 ) -> YoutubeProcessResult:
     """
     主流程：
     1. 有简体字幕 → 下简体 + 简体 txt/srt
     2. 有英文字幕 → 英文 txt/srt + 译简体
     3. 都没有且 fallback_audio → 下音频 Whisper + 译简体
+
+    output_profile:
+      - full: 英/中字幕与 txt 都保留
+      - zh_only: 仅保留中文（总结场景够用：一个 .zh.txt + 可选 .zh.srt）
     """
 
     def _log(msg: str) -> None:
@@ -123,15 +128,23 @@ def process_youtube_url(
             raw_copy.write_bytes(src_path.read_bytes())
             outputs["source_sub"] = raw_copy
 
+            zh_only = output_profile == "zh_only"
+
             if mode == "zh-Hans":
                 zh_txt = out_dir / f"{stem}.zh.txt"
                 zh_txt.write_text(
                     plain if plain.endswith("\n") else plain + "\n", encoding="utf-8"
                 )
                 outputs["zh_txt"] = zh_txt
-                zh_srt = out_dir / f"{stem}.zh.srt"
-                zh_srt.write_text(cues_to_srt(cues), encoding="utf-8")
-                outputs["zh_srt"] = zh_srt
+                if not zh_only:
+                    zh_srt = out_dir / f"{stem}.zh.srt"
+                    zh_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+                    outputs["zh_srt"] = zh_srt
+                else:
+                    # 总结场景：只要一份中文台词即可；可选仍写 srt 方便对齐
+                    zh_srt = out_dir / f"{stem}.zh.srt"
+                    zh_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+                    outputs["zh_srt"] = zh_srt
                 _log(f"已写简体文本: {zh_txt}")
                 return YoutubeProcessResult(
                     mode=mode,
@@ -142,15 +155,16 @@ def process_youtube_url(
                 )
 
             # EN captions
-            en_txt = out_dir / f"{stem}.en.txt"
-            en_txt.write_text(
-                plain if plain.endswith("\n") else plain + "\n", encoding="utf-8"
-            )
-            outputs["en_txt"] = en_txt
-            en_srt = out_dir / f"{stem}.en.srt"
-            en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
-            outputs["en_srt"] = en_srt
-            _log(f"已写英文文本: {en_txt}")
+            if not zh_only:
+                en_txt = out_dir / f"{stem}.en.txt"
+                en_txt.write_text(
+                    plain if plain.endswith("\n") else plain + "\n", encoding="utf-8"
+                )
+                outputs["en_txt"] = en_txt
+                en_srt = out_dir / f"{stem}.en.srt"
+                en_srt.write_text(cues_to_srt(cues), encoding="utf-8")
+                outputs["en_srt"] = en_srt
+                _log(f"已写英文文本: {en_txt}")
 
             if translator is None:
                 return YoutubeProcessResult(
@@ -229,6 +243,7 @@ def process_youtube_url(
             quiet=quiet,
             log=_log,
             keep_audio=keep_audio,
+            output_profile=output_profile,
         )
     except Exception as e:
         return YoutubeProcessResult(
