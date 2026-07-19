@@ -142,7 +142,10 @@ class OpenAICompatTranslator:
         data = json.dumps(body).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
+            "Accept": "application/json",
             "Authorization": f"Bearer {self.config.api_key}",
+            # 部分网关/CDN（如 Cloudflare）会拦截默认 Python-urllib UA
+            "User-Agent": "nvidia-nim-whisper/1.0 (+openai-compat-translate)",
         }
 
         last_err: BaseException | None = None
